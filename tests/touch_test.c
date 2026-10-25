@@ -381,6 +381,44 @@ static void test_pressure(void)
     CHECK(at_n == n0, "no aftertouch for a key that is up");
 }
 
+/* a press whose pill goes on compressing after the note (the FM-1 on 2026-10-25: every note-on was followed by
+ * AF 2, 10, 8, 5, 2, 0 over ~200 ms with the finger still): no aftertouch while the key settles, then a lean
+ * still comes through */
+#ifndef SETTLE_FALL_MS
+#define SETTLE_FALL_MS 40u
+#endif
+#ifndef SETTLE_FIRST_PCT
+#define SETTLE_FIRST_PCT 60u
+#endif
+static void test_settle(void)
+{
+    uint32_t k = 9, t, n0, land = ref_land_for(80), settle_n, max_p = 0;
+    uint32_t first = land + (1023u - land) * SETTLE_FIRST_PCT / 100u;
+    reset_model();
+    n0 = at_per_key[k];
+    m_land[k] = first;
+    m_down[k] = 1;
+    for (t = 0; t < RF_AT_SETTLE_MS; t++) {   /* the reading falls to where the key rests over SETTLE_FALL_MS */
+        m_land[k] = t < SETTLE_FALL_MS ? land + (first - land) * (SETTLE_FALL_MS - t) / SETTLE_FALL_MS : land;
+        run_ms(1);
+        if (at_per_key[k] != n0 && at_last_k == k && at_last_p > max_p)
+            max_p = at_last_p;
+    }
+    settle_n = at_per_key[k] - n0;
+    CHECK(settle_n == 0u, "settling: %u aftertouch messages (up to %u) with the finger still", settle_n, max_p);
+    run_ms(100);
+    CHECK(at_per_key[k] - n0 == 0u, "settled: %u aftertouch messages at rest", at_per_key[k] - n0);
+    for (t = 0; t < 300u; t++) {              /* then a lean: it comes through */
+        m_land[k] = land - (land - SN_DBASE) * 2u * t / 1500u;
+        run_ms(1);
+    }
+    CHECK(at_per_key[k] - n0 > 0u && at_last_k == k && at_last_p >= 50u, "a lean after settling: last sent %u",
+          at_last_p);
+    printf("settle: %u aftertouch messages while the key settled; a lean then %u\n", settle_n, at_last_p);
+    m_down[k] = 0;
+    run_ms(40);
+}
+
 int main(void)
 {
     touch_on(1);
@@ -390,6 +428,7 @@ int main(void)
     test_presses();
     test_merge();
     test_pressure();
+    test_settle();
     printf("touch_test: %d checks, %d failed\n", checks, failed);
     return failed != 0;
 }

@@ -16,7 +16,8 @@
  * A key let go before its velocity came plays nothing. The note-off is the digital release, as in 0.1.
  *
  * Poly aftertouch (AF 53+k p) for the held keys on the analog rows, as touch.c measures their pressure: a change of
- * 2 or more (or to 0 / 127), the keys looked at every RF_AT_MS; 0 when a held key lifts off its seat. */
+ * 2 or more (or to 0 / 127), the keys looked at every RF_AT_MS; 0 when a held key lifts off its seat; none in a
+ * key's first RF_AT_SETTLE_MS (0.2.1: its pill settling read as a lean). */
 #ifndef RF_VEL_WAIT_MS
 #define RF_VEL_WAIT_MS 30u
 #endif
@@ -29,11 +30,14 @@
 #ifndef RF_AT_MS
 #define RF_AT_MS 20u
 #endif
+#ifndef RF_AT_SETTLE_MS
+#define RF_AT_SETTLE_MS 250u                            /* touch.c's P_SETTLE */
+#endif
 static uint8_t rf_tv[RFM_NKEYS];                        /* touch.c's velocity of each key's last press */
 static uint32_t rf_tv_t[RFM_NKEYS], rf_tv_ok;           /* when it came; bit k: not used for a note yet */
 static uint32_t rf_kprev, rf_kwait, rf_kwait_t[RFM_NKEYS];
 static uint8_t rf_at[RFM_NKEYS];                        /* the pressure last sent per key */
-static uint32_t rf_at_ms;
+static uint32_t rf_at_ms, rf_at_held, rf_at_t0[RFM_NKEYS];   /* the keys held, each one's note-on time */
 static uint32_t rf_vel_n[3];                            /* note-ons: measured (analog row), probed (top row), fixed */
 
 static uint32_t rf_caps_dev(void) { return touch_is_on() ? RFM_CAP_VELOCITY | RFM_CAP_AFTERTOUCH : 0u; }
@@ -84,10 +88,16 @@ static uint32_t rf_keys_step(uint32_t keys, uint32_t now)
     return keys & ~rf_kwait;
 }
 
-/* after rfm_app_panel(out, ..): the pressure of the held keys (touch_update keeps it, every 5 ms) */
+/* after rfm_app_panel(out, ..): the pressure of the held keys (touch_update keeps it, every 5 ms). None for a key's
+ * first RF_AT_SETTLE_MS: its pill goes on compressing after the note with the finger still, faster than touch.c's
+ * rest follows it (P_SETTLE), and that read as a lean (on the FM-1: AF 2, 10, 8, 5, 2, 0 after every note-on) */
 static void rf_at_step(uint32_t out, uint32_t now)
 {
-    uint32_t i;
+    uint32_t i, on = out & ~rf_at_held;
+    for (i = 0; on; on >>= 1, i++)
+        if (on & 1u)
+            rf_at_t0[i] = now;
+    rf_at_held = out;
     touch_update();
     if (!touch_is_on() || now - rf_at_ms < RF_AT_MS)
         return;
@@ -98,6 +108,8 @@ static void rf_at_step(uint32_t out, uint32_t now)
             rf_at[i] = 0;                               /* (its note-off ends the pressure) */
             continue;
         }
+        if (now - rf_at_t0[i] < RF_AT_SETTLE_MS)
+            continue;                                   /* settling: nothing sent, rf_at[i] stays 0 */
         p = touch_down(i) ? touch_pressure(i) : 0u;
         if (p == s || (p && p != 127u && p + 1u >= s && p <= s + 1u))
             continue;

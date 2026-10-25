@@ -92,7 +92,15 @@ RemoteFM1 0.1.1 adds TransitFM1 0.1.3's guard: a package whose image reaches pas
 refused by step 1 and by the loader before anything is written, where it would have been committed truncated. Its
 update loader is byte for byte TransitFM1 0.1.3's and answers `ota-FM-1_900`, not 0.1.2's `ota-FM-1_015`.
 
-### 0.2.0: key velocity and pressure (not yet tested on an FM-1)
+### 0.2.1: no aftertouch while a key settles
+
+First run on an FM-1 (2026-10-25, a unit coming from JIANT via the official V15): 29 presses gave velocities 1..127
+(median 92) with none falling back to 100, the top row included; chords and releases were clean; held keys leaned
+into rose to 95..127 and fell back to 0. Every note-on, though, was followed by `AF` 2, 10, 8, 5, 2, 0 over ~200 ms
+with the finger still: the pill goes on compressing after the note faster than the pressure's rest follows it.
+0.2.1 sends no aftertouch in a key's first 250 ms (touch.c's settle time); a lean after that comes through as before.
+
+### 0.2.0: key velocity and pressure
 
 RemoteFM1 0.2.0 measures how hard each key is pressed, on the stock hardware. It uses Charles Vestal's sensing
 (felucca-bsp's analog rows, fm1-base's sense / touch, as in CTL-1 and MONK-1; MPL-2.0).
