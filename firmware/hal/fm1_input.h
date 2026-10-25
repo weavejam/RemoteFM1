@@ -41,6 +41,11 @@
  * (~1/24 of a lit LED); fm1_led_bg[col]: the backlight (menu LIGHTS), fm1_led_bg_ns, shorter. TIMER4
  * times the pulses bit by bit; only a pulse longer than the whole shift waits for the rest. An LED in
  * several layers takes the brightest. fm1_led_key/btn helpers address them by id.
+ * Analog rows (RemoteFM1 0.2, fm1_input_an.h: felucca-bsp's, MPL-2.0): with fm1_an.con set the tick also owns the ADC,
+ * samples rows PA7 / PA8 (a held key with its row driven), probes the top row through PA10 and reads the MASTER pot,
+ * one conversion per tick, started after the latch and taken at the next tick's start (before the rows are read and
+ * before the dim pulses). A held analog key whose FM1_INPUT_LED_OK is 0 keeps its column's lit LEDs dark on the tick
+ * that reads it; the glow and the backlight pulses are not touched (they come after the take). See docs/VELOCITY.md.
  */
 #pragma once
 #include <stdint.h>
@@ -149,6 +154,10 @@ static void fm1__wait(uint32_t us)
     while ((uint32_t)(fm1_ticks() - t0) < span)
         FM1_INPUT_IDLE();
 }
+
+/* the analog key rows (velocity, pressure, the MASTER pot in the scan; fm1_input_tick only): felucca-bsp's, MPL-2.0,
+ * in a file of their own. Off (fm1_an.con 0, the default) the tick does exactly what it did without them */
+#include "fm1_input_an.h"
 
 static void fm1_input_init(void)
 {
@@ -290,6 +299,8 @@ static void fm1_input_tick(void)
     uint32_t lit = fm1_led[p], a = fm1_led_dim[p] & ~lit, b = fm1_led_bg[p] & ~lit & ~a;
     uint32_t ta = a ? FM1__NS_T(FM1_GLOW_NS) : 0u, tb = b ? FM1__NS_T(fm1_led_bg_ns) : 0u;
     uint32_t tmax = ta > tb ? ta : tb;
+    if (fm1_an.pend)                               /* the conversion started last tick, on column p: its row and */
+        fm1__an_take();                            /* PA10 back as they were before the rows are read */
     fm1__led_lines(0);
     fm1_in.raw[p] = (uint8_t)fm1__rows();          /* column p has been latched one tick (the lines dark) */
     if (tmax) {
@@ -309,7 +320,12 @@ static void fm1_input_tick(void)
     } else {
         fm1__sr_word(w);
     }
-    fm1__led_lines(fm1_led[n]);
+    if (n == 0u)
+        fm1__an_frame();                           /* a new frame: the analog rows' turn */
+    if (fm1_an.con)
+        fm1__an_start(n, fm1_led[n]);              /* lights column n and samples it until the next tick */
+    else
+        fm1__led_lines(fm1_led[n]);
     fm1__tick_col = (uint8_t)n;
     fm1__keys(p);                                  /* its keys now: no wait for the frame's end */
     if (n == 0u)
