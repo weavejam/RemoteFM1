@@ -41,7 +41,9 @@ enum {
 #define RFM_HELLO_LEN 67u
 enum {
     RFM_CAP_SHADOW = 1u << 0, RFM_CAP_COPY = 1u << 1, RFM_CAP_RLE = 1u << 2, RFM_CAP_PAL = 1u << 3,
-    RFM_CAP_BATTERY = 1u << 4, RFM_CAP_PLAY_GREEN = 1u << 5, RFM_CAP_LED5 = 1u << 6
+    RFM_CAP_BATTERY = 1u << 4, RFM_CAP_PLAY_GREEN = 1u << 5, RFM_CAP_LED5 = 1u << 6,
+    RFM_CAP_VELOCITY = 1u << 7,          /* 0.2: note-on velocity measured per key (else always RFM_MIDI_KEY_VEL) */
+    RFM_CAP_AFTERTOUCH = 1u << 8         /* 0.2: poly aftertouch AF 53+k p for held keys on the analog rows */
 };
 
 /* SESSION body: start8 keepalive_ms16 */
@@ -83,7 +85,7 @@ enum { RFM_ACK_DECODE_ERR = 1u << 0, RFM_ACK_SHADOW_RESET = 1u << 1 };
 /* panel events as plain MIDI (docs/PROTOCOL.md section 4) */
 #define RFM_MIDI_KEY_CH 15u             /* channel 16, zero-based */
 #define RFM_MIDI_KEY_NOTE0 53u          /* key k -> note 53 + k */
-#define RFM_MIDI_KEY_VEL 100u
+#define RFM_MIDI_KEY_VEL 100u           /* the fixed velocity: without RFM_CAP_VELOCITY, or a key with no reading */
 #define RFM_MIDI_BTN_CH 14u             /* channel 15: note = matrix button id */
 #define RFM_MIDI_BTN_VEL 127u
 #define RFM_MIDI_ENC_CC0 16u            /* encoder e -> CC 16 + e on channel 15, value 64 + detents */

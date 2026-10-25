@@ -50,6 +50,32 @@ static int rf_ep1_room(void);
 static int rf_frame_due(void);
 static void rf_usb_tick(uint32_t sub, uint32_t t0);
 static uint32_t rf_cinf;                                /* CIN 0xF bytes taken into a SysEx (usb.c) */
+
+/* ---- the keys' velocity and pressure (0.2, docs/VELOCITY.md): felucca-bsp's analog rows in the scan
+ * (hal/fm1_input_an.h), fm1-base's sensing (touch.c, sense.c). REMOTE_TOUCH 0 builds 0.1's panel: every key at
+ * RFM_MIDI_KEY_VEL, the converter the main loop's */
+#ifndef REMOTE_TOUCH
+#define REMOTE_TOUCH 1
+#endif
+#if REMOTE_TOUCH
+static void app_key_sample(uint32_t key, uint32_t v, uint32_t ticks, int driven);
+static int app_key_drive(uint32_t key);
+static void app_key_probe(uint32_t key, uint32_t v, uint32_t pressed);
+static int app_key_led_ok(uint32_t key);
+/* the scan's readings, by note key 0..26 (as fm1-base's device/unity.c hands them on) */
+#define FM1_KEY_OF(col, rowbit) ((uint32_t)FM1_KEYMAP[rowbit][col] - 14u)
+#define FM1_INPUT_ANALOG(col, rowbit, v, driven) \
+    (FM1_KEYMAP[rowbit][col] >= 14 ? app_key_sample(FM1_KEY_OF(col, rowbit), (v), fm1_ticks(), (int)(driven)) : (void)0)
+#define FM1_INPUT_DRIVE(col, rowbit) (FM1_KEYMAP[rowbit][col] >= 14 && app_key_drive(FM1_KEY_OF(col, rowbit)))
+#define FM1_INPUT_PROBE(col, rowbit, v, pressed) \
+    (FM1_KEYMAP[rowbit][col] >= 14 ? app_key_probe(FM1_KEY_OF(col, rowbit), (v), (pressed)) : (void)0)
+#define FM1_INPUT_LED_OK(col, rowbit) (FM1_KEYMAP[rowbit][col] < 14 || app_key_led_ok(FM1_KEY_OF(col, rowbit)))
+static uint8_t rf_vel[27];                              /* each note key's velocity for its note-on (rfm_app.c) */
+static uint32_t rf_caps_dev(void);
+#define RFA_KEY_VEL(k) rf_vel[k]
+#define RFA_CAPS_DEV rf_caps_dev()
+#endif
+
 #include "platform.c"
 #include "fm1_adc.h"
 #include "remote_proto.h"
@@ -744,18 +770,74 @@ static void rf_rx_step(void)
         rfm_app_activity();                             /* (SINK too: the keepalive counts every byte) */
 }
 
+/* ---- the keys' velocity (REMOTE_TOUCH; docs/VELOCITY.md). touch.c's glue: the converter to the scan, CTL-1's way
+ * (fm1-base plat_sense): a held key driven, the top row probed, conversions short enough for one tick */
+#if REMOTE_TOUCH
+static uint32_t touch_ms(void) { return fm1_ms; }
+static void touch_sense(int on)
+{
+    if (!on) {
+        fm1_an.con = 0;                                 /* (the conversion in flight is taken at the next tick) */
+        return;
+    }
+    if (!fm1_an.con) {
+        int32_t a = fm1_adc_read(FM1_ADC_MASTER);       /* the pot's slot comes round in two frames: none missing */
+        if (a >= 0)
+            fm1_an.master = (uint16_t)a;
+    }
+    fm1_an.drive = 1;
+    fm1_an.probe = 1;
+    fm1_an.con = (uint16_t)FM1_ADC_CON(7, 2);
+}
+static uint32_t touch_analog_mask(void)                 /* the keys on rows PA7 / PA8: 0..19 */
+{
+    uint32_t m = 0, c, r;
+    for (c = 0; c < FM1_NCOL; c++)
+        for (r = 3; r <= 4u; r++)
+            if (FM1_KEYMAP[r][c] >= 14)
+                m |= 1u << (FM1_KEYMAP[r][c] - 14);
+    return m;
+}
+#include "touch.c"
+#include "rf_touch.c"
+#else
+static uint32_t rf_keys_step(uint32_t keys, uint32_t now) { (void)now; return keys; }
+static void rf_at_step(uint32_t out, uint32_t now) { (void)out; (void)now; }
+#endif
+
+/* the battery (every 250 ms, while no key is down): the SDK's slow conversion, the scan's paused for it */
+static void rf_batt_step(void)
+{
+    static uint32_t batt_ms;
+    int32_t b;
+    uint32_t con;
+    if (fm1_ms - batt_ms < 250u || (fm1_in.notes & 0x7FFFFFFu))
+        return;
+    batt_ms = fm1_ms;
+    con = fm1_an_pause();
+    if (!con)
+        return;
+    b = fm1_adc_read(FM1_ADC_BATT);
+    fm1_an_resume(con);
+    if (b > 0)
+        rf_batt_raw = rf_batt_raw < 0 ? b : rf_batt_raw + (b - rf_batt_raw) / 8;
+}
+
 /* ---- once a millisecond: the panel to rfm_app.c (keys, buttons, encoders; MASTER every 5 ms), the battery,
  * the USB host gone */
 static void rf_ms_step(void)
 {
-    static uint32_t adc_ms, batt_ms, resets;
+    static uint32_t adc_ms, resets;
     int32_t steps[RFM_NENC], master = -1;
-    uint32_t e, keys = fm1_in.notes, btns = fm1_in.buttons, ch, i;
+    uint32_t e, keys = fm1_in.notes, btns = fm1_in.buttons, ch, i, out;
     for (e = 0; e < RFM_NENC; e++)
         steps[e] = fm1_enc_take(e);
     if (fm1_ms - adc_ms >= RFA_MASTER_MS) {
         adc_ms = fm1_ms;
-        master = fm1_adc_read(FM1_ADC_MASTER);
+        if (fm1_an.con)                                 /* the scan reads it (its slot: every second frame) */
+            master = fm1_an.master;
+        else
+            master = fm1_adc_read(FM1_ADC_MASTER);
     }
     if (!rfa.session) {                                 /* waiting: a pressed key lights */
         keys &= 0x7FFFFFFu;
@@ -769,15 +851,11 @@ static void rf_ms_step(void)
         rf_fb_keys = keys;
         rf_fb_btns = btns;
     }
-    rfm_app_panel(keys, btns, steps, master);
+    out = rf_keys_step(keys & 0x7FFFFFFu, fm1_ms);
+    rfm_app_panel(out, btns, steps, master);
+    rf_at_step(out, fm1_ms);
     rf_ev_flush();
-    if (fm1_ms - batt_ms >= 250u) {
-        int32_t b;
-        batt_ms = fm1_ms;
-        b = fm1_adc_read(FM1_ADC_BATT);
-        if (b > 0)
-            rf_batt_raw = rf_batt_raw < 0 ? b : rf_batt_raw + (b - rf_batt_raw) / 8;
-    }
+    rf_batt_step();
     if (rfa.session && (usb.resets != resets || !usb.config || usb.suspended))
         rfm_app_usb_lost();                             /* a bus reset, or the host went away / asleep */
     resets = usb.resets;
@@ -833,10 +911,30 @@ static void rf_lines(void)
     s_put(rf_want[2], "WAITING FOR HOST");
     p = s_put(rf_want[3], "USB ");
     s_put(p, !usb.up ? "OFF" : !usb.config ? "NO HOST" : usb.suspended ? "IDLE" : "HOST CONNECTED");
-    if (bl < 0) {
-        rf_want[4][0] = 0;
-    } else {
-        p = s_put(rf_want[4], "BATTERY ");
+    p = rf_want[4];
+    *p = 0;
+#if REMOTE_TOUCH
+    if (touch_is_on()) {                                /* "BATT 3/3 VEL 999/999/999 TO 99": 30 of 31 */
+        if (bl >= 0) {
+            p = s_put(p, "BATT ");
+            p = s_int(p, (uint32_t)bl);
+            p = s_put(p, "/3 ");
+        }
+        p = s_put(p, "VEL ");                           /* note-ons: measured / probed / fixed 100 */
+        p = s_int(p, rf_vel_n[0] % 1000u);
+        p = s_put(p, "/");
+        p = s_int(p, rf_vel_n[1] % 1000u);
+        p = s_put(p, "/");
+        p = s_int(p, rf_vel_n[2] % 1000u);
+        if (fm1_an.timeouts) {                          /* the converter not done within a tick */
+            p = s_put(p, " TO ");
+            s_int(p, fm1_an.timeouts > 99u ? 99u : fm1_an.timeouts);
+        }
+        bl = -2;
+    }
+#endif
+    if (bl >= 0) {
+        p = s_put(p, "BATTERY ");
         p = s_int(p, (uint32_t)bl);
         s_put(p, "/3");
     }
@@ -936,6 +1034,9 @@ static void app_main(void)
 {
     uint32_t pp = 0xFFFFFFFFu;
     fm1_adc_init();
+#if REMOTE_TOUCH
+    touch_on(1);                                        /* the converter to the scan: velocity, pressure, MASTER */
+#endif
     rf_body_init(&rf_sx.b, &rf_st[RF_T_SX], rf_sx_buf, sizeof rf_sx_buf, rf_on_msg, (void *)(uintptr_t)RF_T_SX);
     rf_body_init(&rf_bk.b, &rf_st[RF_T_BK], rf_bk_buf, sizeof rf_bk_buf, rf_on_msg, (void *)(uintptr_t)RF_T_BK);
     rfm_app_init(rf_shadow, rf_stage, RF_STAGE_PX, &RF_LCD);

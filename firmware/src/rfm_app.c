@@ -50,6 +50,12 @@ static void rfa_diag(uint32_t t, uint32_t cmd, const uint8_t *body, uint32_t len
 #define RFA_GREEN_COL 8u                    /* PLAY's green LED: column 8, row bit 1 (ChoralRoot ui_input.c) */
 #define RFA_GREEN_BIT 0x02u
 #define RFA_CAPS (RFM_CAP_SHADOW | RFM_CAP_COPY | RFM_CAP_RLE | RFM_CAP_PAL | RFM_CAP_PLAY_GREEN)
+#ifndef RFA_CAPS_DEV
+#define RFA_CAPS_DEV 0u                     /* the includer's: RFM_CAP_VELOCITY, RFM_CAP_AFTERTOUCH (remote.c) */
+#endif
+#ifndef RFA_KEY_VEL
+#define RFA_KEY_VEL(k) RFM_MIDI_KEY_VEL     /* note key k's note-on velocity, 1..127 (remote.c: measured) */
+#endif
 #define RFA_QN 8u                           /* ENDs waiting for their FRAME_ACK */
 #define RFA_PANEL_MS 500u
 #define RFA_MASTER_MS 5u
@@ -123,7 +129,7 @@ static void rfa_hello(uint32_t t)
         h[43 + i] = (uint8_t)ID[i];
     rfa_wr16(h + RFM_HELLO_SCREEN_W, RFM_W);
     rfa_wr16(h + RFM_HELLO_SCREEN_H, RFM_H);
-    rfa_wr16(h + RFM_HELLO_CAPS, RFA_CAPS | (rfa.batt_mv ? RFM_CAP_BATTERY : 0u));
+    rfa_wr16(h + RFM_HELLO_CAPS, RFA_CAPS | RFA_CAPS_DEV | (rfa.batt_mv ? RFM_CAP_BATTERY : 0u));
     h[RFM_HELLO_INFLIGHT] = RFM_FRAMES_IN_FLIGHT;
     h[RFM_HELLO_SESSION] = rfa.session;
     for (i = 0; i < 8u && i < sizeof VER - 1u; i++)
@@ -363,7 +369,7 @@ static void rfm_app_panel(uint32_t keys, uint32_t buttons, const int32_t *steps,
     for (ch = keys ^ rfa.keys, i = 0; ch; ch >>= 1, i++)
         if (ch & 1u) {
             uint32_t on = (keys >> i) & 1u;
-            rfa_midi((on ? 0x90u : 0x80u) | RFM_MIDI_KEY_CH, RFM_MIDI_KEY_NOTE0 + i, on ? RFM_MIDI_KEY_VEL : 0u);
+            rfa_midi((on ? 0x90u : 0x80u) | RFM_MIDI_KEY_CH, RFM_MIDI_KEY_NOTE0 + i, on ? (uint32_t)RFA_KEY_VEL(i) : 0u);
         }
     rfa.keys = keys;
     for (ch = buttons ^ rfa.buttons, i = 0; ch; ch >>= 1, i++)
@@ -388,6 +394,15 @@ static void rfm_app_panel(uint32_t keys, uint32_t buttons, const int32_t *steps,
                                     rfa.now - rfa.master_ms >= RFA_MASTER_MS))
             rfa_master_send();
     }
+}
+
+/* a held note key's pressure as poly aftertouch (AF 53+k p, 0..127); nothing for a key not down (its note-off ended
+ * it). The includer rate-limits it (remote.c rf_at_step) */
+static void rfm_app_key_pressure(uint32_t k, uint32_t p)
+{
+    if (k >= RFM_NKEYS || !((rfa.keys >> k) & 1u))
+        return;
+    rfa_midi(0xA0u | RFM_MIDI_KEY_CH, RFM_MIDI_KEY_NOTE0 + k, p > 127u ? 127u : p);
 }
 
 /* ------------------------------------------------------------ poll --- */
