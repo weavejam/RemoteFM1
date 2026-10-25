@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: GPL-3.0-only
 # fwsc: build the RemoteFM1 package (build/remote.fwsc) and run the firmware's host tests, on every push to velocity /
 # main (and by hand). The package is kept as the run's artifact, with its sha256.
-# Runs on the weavejam org's self-hosted Linux runners (GitHub-hosted runners are not available to the org). The
-# runner needs curl, xz, a C compiler and python3; Pillow comes from a venv if the system has none. The JieLi
-# toolchain (tools/get_toolchain.sh) and the three AC79 SDK files tools/build.py checks by SHA-256 are downloaded once
-# and cached.
+# Runs on GitHub-hosted ubuntu-latest (free for a public repository; the build is Linux x86-64 only). Pillow comes
+# from a venv if the system has none. The JieLi toolchain (tools/get_toolchain.sh) and the three AC79 SDK files
+# tools/build.py checks by SHA-256 are downloaded once and kept in the Actions cache.
 name: fwsc
 
 on:
@@ -14,14 +13,19 @@ on:
 
 jobs:
   build:
-    runs-on: [self-hosted, Linux]
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      JIELI_HOME: ${{ github.workspace }}/../.rfm1-cache/jieli
-      AC79_SDK: ${{ github.workspace }}/../.rfm1-cache/sdk
+      JIELI_HOME: ${{ github.workspace }}/.rfm1-cache/jieli
+      AC79_SDK: ${{ github.workspace }}/.rfm1-cache/sdk
       SDK_RAW: https://gitee.com/Jieli-Tech/fw-AC79_AIoT_SDK/raw/AC79NN_SDK_V1.2.1_2023-12-13/cpu/wl82/tools
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/cache@v4
+        with:
+          path: .rfm1-cache
+          key: rfm1-toolchain-${{ hashFiles('tools/get_toolchain.sh', 'tools/build.py') }}
 
       - name: Tools
         run: |
