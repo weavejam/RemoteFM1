@@ -32,7 +32,7 @@ One message = a command byte + a body (8-bit bytes, multi-byte fields **little e
   | offset | field |
   |---|---|
   | 51 | `screen_w16` (240), `screen_h16` (240) |
-  | 55 | `caps16`: bit0 shadow frame buffer, bit1 COPY, bit2 RLE, bit3 PAL, bit4 battery reading, bit5 PLAY green LED, bit6 five LED levels (else: lit / dim / faint, mid shown as dim) |
+  | 55 | `caps16`: bit0 shadow frame buffer, bit1 COPY, bit2 RLE, bit3 PAL, bit4 battery reading, bit5 PLAY green LED, bit6 five LED levels (else: lit / dim / faint, mid shown as dim), bit7 measured key velocity (firmware 0.2+; else every Note On is 100), bit8 poly aftertouch for held keys (0.2+). Bits a host does not know are to be ignored |
   | 57 | `max_frames_in_flight8` (2) |
   | 58 | `session8` (1 while a session is active) |
   | 59 | `fw_ver[8]` (the RemoteFM1 version string) |
@@ -52,7 +52,7 @@ One message = a command byte + a body (8-bit bytes, multi-byte fields **little e
   - A USB reset or unplug also ends the session.
   - Reply: **ACK** (`0x46`, empty).
 
-- **Waiting screen** (no session): "REMOTE FM1", the version, "WAITING FOR HOST", the battery when known, and a red line
+- **Waiting screen** (no session): "REMOTE FM1", the version, "WAITING FOR HOST", the battery when known (from 0.2, with the velocity counters: "BATT n/3 VEL m/p/f", docs/VELOCITY.md), and a red line
   when the update loader isn't staged. The key LEDs glow dim so the panel can be found. The device runs no other UI.
 
 ## 3. Host → device: LEDs and screen
@@ -104,12 +104,15 @@ what differs.
 
 | what | message |
 |---|---|
-| note key `k` (0..26, matrix id `14 + k`, `emu_hal_t.keys` bit `k`; key 0 = F3) | Note On `9F 53+k 100` / Note Off `8F 53+k 0` (channel 16) |
+| note key `k` (0..26, matrix id `14 + k`, `emu_hal_t.keys` bit `k`; key 0 = F3) | Note On `9F 53+k v` / Note Off `8F 53+k 0` (channel 16). `v` is 100 in firmware 0.1. From 0.2 (caps bit7) `v` is the measured velocity 1..127, or 100 when a key has no reading; the Note On waits up to 30 ms for it (docs/VELOCITY.md) |
+| held note key `k` on the analog rows (k 0..19, F3..C5), from 0.2 (caps bit8) | Poly aftertouch `AF 53+k p`, p 0..127: how much harder the key is pressed than it rests. A key is looked at every 20 ms and sends only a change of 2 or more, or a move to 0 or 127; there is none after its Note Off. A host may ignore it |
 | button `b` (matrix id 0..13, `emu_hal_t.buttons` bit `b`: 0 OCT-, 1 OCT+, 2 FX, 3 SEL, 4 ENV, 5 LFO, 6 EDIT, 7 GLO, 8 HOME, 9 SAVE, 10 ARP, 11 SEQ, 12 PLAY, 13 REC) | Note On `9E b 127` / Note Off `8E b 0` (channel 15) |
 | matrix encoder `e` (0..6, `emu_hal_t.enc[e]`, + clockwise) | `BE 16+e 64+d`, with `d` the detents since the last report, never 0; a turn of more than 63 detents is **split** into several messages of at most ±63, so nothing is lost. Deltas are in matrix sense: `emu_hal_t.enc[e]` moves by exactly `d` |
 | MASTER pot (ADC 0..1023, `emu_hal_t.master`) | `BE 07 v14>>7` then `BE 27 v14&0x7F`, with `v14 = adc << 4`. Sent on a change of ≥ 2 counts, at most every 5 ms, and always when a session starts |
 
-- Events go out in the order they were detected, with no batching delay.
+- Events go out in the order they were detected, with no batching delay. (From 0.2, a key's Note On is detected
+  once its velocity is known; until then the key is not in PANEL_R's `keys32` either. A key let go before that sends
+  nothing.)
 - A DAW sees the same messages, so RemoteFM1 also works as a plain MIDI controller.
 
 ### PANEL_R (`0x53`): the whole panel, for resync

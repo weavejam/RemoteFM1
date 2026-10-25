@@ -92,6 +92,23 @@ RemoteFM1 0.1.1 adds TransitFM1 0.1.3's guard: a package whose image reaches pas
 refused by step 1 and by the loader before anything is written, where it would have been committed truncated. Its
 update loader is byte for byte TransitFM1 0.1.3's and answers `ota-FM-1_900`, not 0.1.2's `ota-FM-1_015`.
 
+### 0.2.0: key velocity and pressure (not yet tested on an FM-1)
+
+RemoteFM1 0.2.0 measures how hard each key is pressed, on the stock hardware. It uses Charles Vestal's sensing
+(felucca-bsp's analog rows, fm1-base's sense / touch, as in CTL-1 and MONK-1; MPL-2.0).
+
+- Note On velocity is 1..127. A key with no reading gets the old fixed 100.
+- Poly aftertouch `AF 53+k p` for held keys F3..C5.
+- HELLO caps bits 7 and 8 announce both.
+- Hosts that don't know about it work as before.
+- The scan now owns the ADC: the keys, MASTER and the top-row probe. The battery is read in a short pause, only
+  while no key is down.
+- The note-on of a key on the analog rows comes 14..17 ms after the contact instead of about 2 ms: it waits for the
+  velocity.
+
+[docs/VELOCITY.md](docs/VELOCITY.md) lists what was taken from where and what must be checked on a unit before 0.2.0
+is offered to users.
+
 Installing firmware is at your own risk. Keep the [FM-1 Transporter](https://github.com/kurogedelic/FM-1-transporter)
 or [MvaveFM1Unbricker](https://github.com/Quixotic7/MvaveFM1Unbricker) at hand.
 
@@ -114,6 +131,8 @@ host/run_tests.sh           # the host library's tests, including the cross test
 firmware/src/remote.c       the device app: USB service, waiting screen, panel input, LEDs, glue
 firmware/src/rfm_app.c      the protocol layer (no hardware; also compiled into the host tests)
 firmware/src/rfm_draw.c     the TILES decoder;  rfm_push.c: the screen push, which never blocks USB
+firmware/src/rf_touch.c     0.2: velocity / aftertouch into the panel events; touch.c, sense.c (MPL-2.0): the sensing
+firmware/hal/fm1_input_an.h 0.2: the analog key rows in the scan (MPL-2.0); docs/VELOCITY.md
 firmware/                   everything else: TransitFM1's platform, boot stub, update loader, USB (+ vendor interface)
 proto/, docs/PROTOCOL.md    the protocol
 host/                       libremotefm1, the macOS back ends, fm1remote, tests

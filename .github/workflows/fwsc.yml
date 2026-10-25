@@ -1,0 +1,64 @@
+# SPDX-License-Identifier: GPL-3.0-only
+# fwsc: build the RemoteFM1 package (build/remote.fwsc) and run the firmware's host tests, on every push to velocity /
+# main (and by hand). The package is kept as the run's artifact, with its sha256.
+# Runs on the weavejam org's self-hosted Linux runners (GitHub-hosted runners are not available to the org). The
+# runner needs curl, xz, a C compiler and python3; Pillow comes from a venv if the system has none. The JieLi
+# toolchain (tools/get_toolchain.sh) and the three AC79 SDK files tools/build.py checks by SHA-256 are downloaded once
+# and cached.
+name: fwsc
+
+on:
+  push:
+    branches: [velocity, main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: [self-hosted, Linux]
+    timeout-minutes: 30
+    env:
+      JIELI_HOME: ${{ github.workspace }}/../.rfm1-cache/jieli
+      AC79_SDK: ${{ github.workspace }}/../.rfm1-cache/sdk
+      SDK_RAW: https://gitee.com/Jieli-Tech/fw-AC79_AIoT_SDK/raw/AC79NN_SDK_V1.2.1_2023-12-13/cpu/wl82/tools
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tools
+        run: |
+          for t in curl xz tar cc python3; do command -v $t >/dev/null || { echo "::error::the runner has no $t"; exit 1; }; done
+          if ! python3 -c 'import PIL' 2>/dev/null; then
+            python3 -m venv "$RUNNER_TEMP/venv"
+            "$RUNNER_TEMP/venv/bin/pip" install -q Pillow
+            echo "PYTHON=$RUNNER_TEMP/venv/bin/python3" >> "$GITHUB_ENV"
+            echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+          fi
+
+      - name: JieLi toolchain and AC79 SDK files (cached)
+        run: |
+          if [ ! -x "$JIELI_HOME/toolchain/pi32v2/bin/clang" ]; then
+            rm -rf "$JIELI_HOME"
+            sh tools/get_toolchain.sh "$JIELI_HOME"
+          fi
+          mkdir -p "$AC79_SDK/cpu/wl82/tools/cfg"
+          for f in uboot.boot cfg_tool.bin cfg/eq_cfg_hw.bin; do
+            [ -s "$AC79_SDK/cpu/wl82/tools/$f" ] || curl -fsSL --retry 3 -o "$AC79_SDK/cpu/wl82/tools/$f" "$SDK_RAW/$f"
+          done
+          echo "JIELI_TOOLCHAIN=$JIELI_HOME/toolchain" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: |
+          ./build.sh 2>&1 | tee build.log
+          if grep -E "warning|WARNING" build.log; then echo "::error::the build has warnings"; exit 1; fi
+          sha256sum build/remote.fwsc | tee build/remote.fwsc.sha256
+
+      - name: Host tests
+        run: sh tests/run_tests.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: remote-fwsc-${{ github.sha }}
+          path: |
+            build/remote.fwsc
+            build/remote.fwsc.sha256
+            build/remote.bin
+          if-no-files-found: error
