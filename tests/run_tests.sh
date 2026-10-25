@@ -67,6 +67,9 @@ $CC $SAN -o "$H/rfm_draw_test" tests/rfm_draw_test.c
 echo "== the protocol layer: a scripted session from both transports (firmware/src/rfm_app.c)"
 $CC $SAN -o "$H/session_test" tests/session_test.c
 "$H/session_test"
+echo "== 0.2's key velocity and pressure: fm1-base's sensing in fixed point, the note-on that waits for it (firmware/src/touch.c, sense.c, rf_touch.c)"
+$CC $SAN -o "$H/touch_test" tests/touch_test.c -lm
+"$H/touch_test"
 echo "== usb.c's EP1 parser and long SysEx: M0's lost byte (CIN 0xF), TransitFM1's parser and RemoteFM1's"
 $CC $SAN -Wno-int-to-pointer-cast -o "$H/usb_midi_test" tests/usb_midi_test.c
 "$H/usb_midi_test"

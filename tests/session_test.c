@@ -162,7 +162,8 @@ static void send_bk(uint32_t cmd, const uint8_t *body, uint32_t n)
     static uint8_t w[RF_BK_HDR + RFM_BK_BODY_MAX];
     uint32_t i;
     rf_bk_header(w, cmd, n, bk_seq++);
-    memcpy(w + RF_BK_HDR, body, n);
+    if (n)                                              /* (memcpy from NULL, even of 0 bytes, is UB: UBSan) */
+        memcpy(w + RF_BK_HDR, body, n);
     rfm_app_activity();
     for (i = 0; i < RF_BK_HDR + n; i += 64)              /* 64-byte USB packets */
         rf_bk_feed(&bk, w + i, RF_BK_HDR + n - i < 64 ? RF_BK_HDR + n - i : 64);
