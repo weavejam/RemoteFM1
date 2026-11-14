@@ -4,7 +4,8 @@
 // firmware and mode, a direct install, the V15 detour (refused direct, V15, then RemoteFM1), resume from update mode,
 // the errors (firmwareUnavailable on a 404 and a network error, portBusy, sysexDenied, disconnected mid-write, busy,
 // refused, cancelled, timeout on a loader's stall) and the progress order; a cancel at every sync point before and
-// after the commit to the write (no write SysEx after an acknowledged cancel); the dispatch (unknown, inherited,
+// after the commit to the write (no write SysEx after an acknowledged cancel; cancelled even when the awaited operation
+// then fails: a download error, sysex denied, a port that won't open, a silent FM-1); the dispatch (unknown, inherited,
 // non-string and missing ops, malformed arguments: one reply each). Plus installer.js's pure decisions. Never against
 // a real unit.
 //   node web/test_engine.mjs
@@ -32,7 +33,8 @@ globalThis.clearTimeout = (h) => { if (h instanceof Timer) { h.cleared = true; r
 // The sync points: every place the engine waits on the outside world calls point(label): a fetch, the MIDI access, a
 // port's open, a message the fake FM-1 takes, the SHA-256 (crypto.subtle.digest). sync.trace: the labels, numbered
 // ("rx hs#2": the second handshake). With sync.target set, the run stops at that point: the engine's timers frozen,
-// sync.hit({ key, release }) called; release() lets it go on.
+// sync.hit({ key, release, reject }) called; release() lets it go on, reject(e) makes the awaited operation fail with e
+// (a fetch, the MIDI access, a port's open, the digest; at a message the fake FM-1 takes, it goes silent: see rig).
 const sync = { trace: [], target: null, hit: null };
 async function point(label) {
   const n = sync.trace.filter((k) => k.startsWith(label + "#")).length + 1, key = `${label}#${n}`;
@@ -40,9 +42,10 @@ async function point(label) {
   if (sync.target !== key) return;
   sync.target = null;
   frozen = [];
-  await new Promise((release) => sync.hit({ key, release }));
+  const failure = await new Promise((go) => sync.hit({ key, release: () => go(null), reject: (e) => go(e) }));
   const due = frozen; frozen = null;
   due.forEach((f) => f());
+  if (failure) throw failure;
 }
 const realDigest = crypto.subtle.digest.bind(crypto.subtle);
 crypto.subtle.digest = async (...a) => { await point("digest"); return realDigest(...a); };
@@ -88,7 +91,8 @@ const ROUTES = { [`${BASE}remote-9.9.fwsc`]: raw, [V15]: raw, [RELEASES_URL]: { 
 // reply, in order. The MIDI access is a sync point ("midi"), and so are the fake FM-1's ports and messages
 function rig({ dev = null, routes = ROUTES, midi, releases = RELEASES, idleMs } = {}) {
   const { port1, port2 } = new MessageChannel();
-  if (dev && dev.gate === null) dev.gate = (kind) => point(kind === "open" ? "open" : `rx ${kind}`);
+  // (a rejected rx point: the fake FM-1 never takes that message nor any after it, it goes silent)
+  if (dev && dev.gate === null) dev.gate = (kind) => kind === "open" ? point("open") : point(`rx ${kind}`).catch(() => new Promise(() => {}));
   const engine = createEngine({ requestMIDIAccess: midi || (async () => { await point("midi"); return dev.access; }), fetch: fakeFetch(routes), releases,
                                 v15Sha256: V15_SHA, idleMs });
   engine.attach(port2);
@@ -306,7 +310,8 @@ for (const [o, what] of [[{ held: true }, "held by another app (open fails)"], [
 // run an install to its sync point key (null: through, no stop) -> { hit, reply, cancel, sentAtAck, trace }
 // whileHeld(r, dev): what the host does while the engine is held there (default: a cancel)
 const IDLE = { step1: 1000, write: 1000 };            // (the stall tests: how long a silent FM-1 is waited for)
-async function installHeld(scn, key, whileHeld = async (r) => ({ cancel: await r.send("cancel", {}) })) {
+// fail: the held operation then rejects (with failureAt(key)) instead of going on
+async function installHeld(scn, key, whileHeld = async (r) => ({ cancel: await r.send("cancel", {}) }), { fail = false } = {}) {
   const dev = scn.dev(), r = await configured({ dev, releases: null });
   sync.trace = []; sync.target = key;
   const hit = key ? new Promise((res) => { sync.hit = res; }) : null;
@@ -316,7 +321,7 @@ async function installHeld(scn, key, whileHeld = async (r) => ({ cancel: await r
   if (h) {
     held = await whileHeld(r, dev);
     sentAtAck = dev.sent.length;
-    h.release();
+    if (fail) h.reject(failureAt(h.key)); else h.release();
   }
   const reply = await inst;
   sync.target = null;
@@ -336,6 +341,15 @@ function pointsOf(trace, upgrades) {
   return { head, commit };
 }
 const WRITE_KINDS = ["upgrade", "data"];
+// what a rejected sync point fails with: a download error, a denied permission, a port that won't open, a failed
+// digest; at a message the fake FM-1 takes, (rig) it goes silent
+function failureAt(key) {
+  if (key.startsWith("fetch ")) return new TypeError("Failed to fetch");
+  if (key.startsWith("midi")) return Object.assign(new Error("denied"), { name: "NotAllowedError" });
+  if (key.startsWith("open")) return Object.assign(new Error("port in use"), { name: "InvalidAccessError" });
+  if (key.startsWith("digest")) return new Error("digest failed");
+  return new Error("silent");
+}
 const SCENARIOS = [
   // the V15 detour's two installs, each its own op: the V15 over SLOOP (its context() fetches releases.json last,
   // after the look: the review's case), then RemoteFM1 over the V15 the unit then runs
@@ -371,6 +385,25 @@ for (const scn of SCENARIOS) {
   }
   ok(pre === commit, `cancel, ${scn.what}: at each of the ${commit} points before the write: cancelled, no write SysEx after the ack`, J(bad));
   ok(post === head.length - commit, `cancel, ${scn.what}: at each of the ${head.length - commit} after (to the loader's UPGRADE): busy, the install finishes`, J(bad));
+  // the same points, the awaited operation then rejected (a download error, sysex denied, a port that won't open, a
+  // silent FM-1): an acknowledged cancel still ends "cancelled", never the failure, and no write SysEx leaves.
+  // (The control, without the cancel: the same rejection ends in its own error, never "cancelled"; or the engine
+  // tolerates it (a later probe's port that won't open, context()'s releases.json) and the install goes on.)
+  let rej = 0, own = 0, fatal = 0;
+  const badRej = [];
+  for (let k = 0; k < commit; k++) {
+    const t = await installHeld(scn, head[k], undefined, { fail: true });
+    const after = t.sentAtAck === null ? [] : t.dev.sent.slice(t.sentAtAck);
+    if (t.hit && t.cancel.ok && t.cancel.result.cancelled === true && !t.reply.ok && t.reply.error.code === "cancelled" &&
+        /^cancelled/.test(t.reply.error.detail) && !after.some((x) => WRITE_KINDS.includes(x)) && t.dev.upgrades === 0 && t.dev.served === 0) rej++;
+    else badRej.push([head[k], t.cancel, t.reply, after]);
+    const c = await installHeld(scn, head[k], async () => ({}), { fail: true });
+    if (c.hit && (c.reply.ok ? c.dev.bad === 0 : c.reply.error.code !== "cancelled" && c.dev.upgrades === 0)) own++;
+    else badRej.push(["no cancel", head[k], c.reply]);
+    if (!c.reply.ok) fatal++;
+  }
+  ok(rej === commit, `cancel, ${scn.what}: at each of the ${commit}, the operation then rejected: cancelled, no write SysEx`, J(badRej));
+  ok(own === commit && fatal > 0, `cancel, ${scn.what}: (control) without the cancel: ${fatal} of them fail on their own error, never cancelled`, J(badRej));
 }
 {   // the review's case by name: a cancel while context() fetches releases.json, after the look, just before the write
   const scn = SCENARIOS[0];

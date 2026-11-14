@@ -328,7 +328,11 @@ export function createEngine({ requestMIDIAccess, fetch: fetchFn, releases = nul
       reply({ ok: true, result });
     } catch (e) {
       log(String((e && e.stack) || e));
-      reply({ ok: false, error: toEngineError(e).toJSON() });
+      // a cancel acknowledged before the write takes precedence: whatever the pending await then rejected with (a
+      // download error, a denied permission, a port that would not open, a silent FM-1), the host was promised
+      // "cancelled". (cancelOp sets cancelled only while not writing; after the commit a cancel is busy.)
+      const err = me && me.cancelled && !me.writing ? cancelled() : toEngineError(e);
+      reply({ ok: false, error: err.toJSON() });
     } finally { if (me && current === me) current = null; }
   }
 

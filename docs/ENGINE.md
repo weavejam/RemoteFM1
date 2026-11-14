@@ -57,12 +57,13 @@ A message that is neither (not an object, or with no `id` and no `op`) gets no r
 - `cancel()` → `{ cancelled: boolean }`. Aborts an install before the write: during the download, the check, the
   look, or anything else the install waits on before it commits to the write. A `{ cancelled: true }` reply is a
   promise: that install never sends a write SysEx, and its own reply is `error.code = 'cancelled'` (`detail` starts
-  `cancelled`). The engine checks for a cancel after each of those waits, and makes its last check and its commit
-  with nothing in between. From the commit on (the update's own handshake, just before the update request), the
-  install can't be aborted. `cancel` then gets an `error.code = 'busy'` reply, never `cancelled`, and the install
-  goes on to its own reply. A `cancel` during `config` or `look` is also `busy`. With nothing running, the reply is
-  `{ cancelled: false }`. The V15 detour is two installs (the V15, then RemoteFM1), and each has its own checks and
-  commit.
+  `cancelled`), even when the wait it was in then fails (a download error, a denied MIDI permission, a port that
+  won't open, a silent FM-1): an acknowledged cancel takes precedence over that error. The engine checks for a
+  cancel after each of those waits, and makes its last check and its commit with nothing in between. From the
+  commit on (the update's own handshake, just before the update request), the install can't be aborted. `cancel`
+  then gets an `error.code = 'busy'` reply, never `cancelled`, and the install goes on to its own reply. A `cancel`
+  during `config` or `look` is also `busy`. With nothing running, the reply is `{ cancelled: false }`. The V15
+  detour is two installs (the V15, then RemoteFM1), and each has its own checks and commit.
 
 Exactly one op (`config`, `look` or `install`) runs at a time. Any of them sent while another runs gets
 `error.code = 'busy'`. Only `cancel` is answered while an op runs.
