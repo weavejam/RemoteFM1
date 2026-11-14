@@ -184,14 +184,20 @@ export function pairOutput(access, input) {
 const FM1_PORT = PORT_RE;                                       // never probe other gear (the FM-1s and SMK-37s)
 
 export class Updater {
-  constructor(access, log) {
+  // portRe: the port names probed (default PORT_RE; the engine adds firmwares' own port names, e.g. "JIANT FM").
+  // opts.idleMs: { step1, write }, how long step 1 and the loader may stay silent (default 8 s and 180 s; the tests
+  // shorten them)
+  constructor(access, log, portRe = FM1_PORT, opts = {}) {
     this.access = access;
     this.log = log || (() => {});
+    this.portRe = portRe || FM1_PORT;
+    const idle = opts.idleMs || {};
+    this.idle = { step1: idle.step1 || 8000, write: idle.write || 180000 };
   }
 
   // the input ports that may be an FM-1 (connected, a name that matches)
   candidates() {
-    return [...this.access.inputs.values()].filter((p) => p.state !== "disconnected" && FM1_PORT.test(p.name || ""));
+    return [...this.access.inputs.values()].filter((p) => p.state !== "disconnected" && this.portRe.test(p.name || ""));
   }
 
   // every in/out pair with the same port name that answers the handshake (all: every one, their links closed)
@@ -269,7 +275,7 @@ export class Updater {
     step("start", dev.id.text);
     dev.link.send(UPGRADE);
     await sleep(2000);
-    const s1 = await this.serve(dev.link, image, 0xE0000000, 8000, (n) => step("verify", n));
+    const s1 = await this.serve(dev.link, image, 0xE0000000, this.idle.step1, (n) => step("verify", n));
     dev.link.close();
     // some firmwares restart into their loader at once, without step 1: such a loader (ours, of this keyboard) goes on
     const jumped = !s1.finished && s1.lost && s1.served === 0;
@@ -296,11 +302,13 @@ export class Updater {
     return back.id.text;
   }
 
-  // step 2 with the loader found by find()/waitFor()
+  // step 2 with the loader found by find()/waitFor(). step("writing") before the loader's update request: from here
+  // a stall is the loader's (it may hold a part of the new image), not step 1's
   async write(ota, image, step) {
+    step("writing");
     ota.link.send(UPGRADE);
     await sleep(2000);
-    const s2 = await this.serve(ota.link, image, 0xF0000000, 180000, (n) => step("write", n));
+    const s2 = await this.serve(ota.link, image, 0xF0000000, this.idle.write, (n) => step("write", n));
     ota.link.close();
     return s2;
   }
