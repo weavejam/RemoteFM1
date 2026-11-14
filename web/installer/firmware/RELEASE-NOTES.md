@@ -1,3 +1,26 @@
+# RemoteFM1 0.2.1 (the latest)
+
+`remote-0.2.1.fwsc`, sha256 `62a6b619c73b88248591067bd414124b288fa7628b26cc2b3895a2957f52f362`, 610594 B: weavejam's
+build, from [weavejam/RemoteFM1@08bae22](https://github.com/weavejam/RemoteFM1/tree/08bae220674f38e57df195a12a5b95b38d7efd4b)
+(branch `velocity`), the `remote.fwsc` of its fwsc CI run 40208827364. It is not Quixotic7's `v0.2.1` tag, which is
+another firmware. Its files from fm1-base and felucca-bsp stay MPL-2.0, file by file (`LICENSES/MPL-2.0.txt`).
+
+## What changed from 0.1.1: velocity, poly aftertouch
+
+- **Key velocity.** Note On carries velocity 1..127, measured from the keys' carbon pills (CTL-1's sensing); the top
+  row too. A note-on waits up to ~15 ms for its velocity; a key with no reading plays at 100, as before.
+- **Poly aftertouch** for held keys F3..C5: lean into a key once it has settled.
+- **The 250 ms AT settle.** A key sends no aftertouch in its first 250 ms, while its pill is still compressing (0.2.0
+  sent AF 2, 10, 8, 5, 2, 0 after every note with the finger still).
+- New capability bits (7, 8) in HELLO; hosts that don't know them work as with 0.1.
+
+The update loader, the boot stub and TransitFM1's safeguards are 0.1.1's.
+
+## Testing
+
+On an FM-1, 2026-10-25: velocities 1..127 with no fallbacks, chords and releases clean, MASTER, LEDs, buttons and
+encoders as 0.1.1. This is the package TuttiDAW shipped and installed (same SHA-256).
+
 # RemoteFM1 0.1.1
 
 `remote-0.1.1.fwsc`, sha256 `a7408d6c0526e01ef80e81c7350082ff203beaca3eabee52899748fc730a96a7`, built with

@@ -71,7 +71,7 @@ ok(cat.firmwares.every((f) => cat.categories.includes(f.category)), "catalog: ev
   const rel = JSON.parse(readFileSync(new URL("../installer/releases.json", import.meta.url), "utf8")), r0 = rel.releases[0];
   const rf = cat.firmwares.find((f) => f.id === "remotefm1");
   ok(rf && rf.name === "RemoteFM1" && rf.version === r0.version && rf.author === "Quixotic7" && rf.license === "GPL-3.0-only"
-     && rf.source === "https://github.com/Quixotic7/RemoteFM1" && rf.category === "Other", "remotefm1: in the catalog, the first release's version, author, licence, source, Other");
+     && rf.source === (r0.source || rel.repo) && rf.release === (r0.tag ? `${rel.repo}/releases/tag/${r0.tag}` : null) && rf.category === "Other", "remotefm1: in the catalog, the first release's version, author, licence, source (its own, else the repo), release, Other");
   ok(rf.engines.join() === "emu" && rf.defaultEngine === "emu" && !rf.native && rf.badge === "meta" && rf.blurb, "remotefm1: emulated only, a meta badge and a blurb");
   const pageUrl = "https://quixotic7.github.io/RemoteFM1/site/", pkgUrl = new URL(rf.emu.pkg, pageUrl);
   ok(!/^[a-z][\w+.-]*:|^\/\//i.test(rf.emu.pkg) && pkgUrl.origin === new URL(pageUrl).origin && rf.emu.pkg === cat.paths.installer + `firmware/remote-${r0.version}.fwsc`,
@@ -455,7 +455,8 @@ if (!existsSync(new URL("remotefm1.mjs", BUILT)) || !existsSync(new URL("fakeuni
      && sourceOf(F("jiant"), "native", credits).url === `https://github.com/juanjiant-bit/JIANT/tree/${jn.commit}`,
      "source: native, the core's pinned commit (FM1VST's submodule) and FM1VST's core-glue/<family>");
   const rf = sourceOf(F("remotefm1"), "emu", credits);
-  ok(rf.url === "https://github.com/Quixotic7/RemoteFM1/tree/v" + F("remotefm1").version && / · GPL-3.0-only · source at v/.test(rf.title), "source: RemoteFM1, this repo at its release's tag");
+  ok(rf.url === "https://github.com/weavejam/RemoteFM1/tree/08bae220674f38e57df195a12a5b95b38d7efd4b" && rf.refKind === "commit"
+     && / · GPL-3.0-only · source at commit 08bae22$/.test(rf.title), "source: RemoteFM1 0.2.1, the fork's commit it was built from (not upstream's v0.2.1 tag)");
   ok(sourceOf({ id: "local-FM-1.fwsc", name: "FM-1", local: true, source: null }, "emu") === null && sourceOf({ id: "y", name: "Y", source: null, repo: null }, "emu") === null && sourceOf(null, "emu") === null,
      "source: stock M-VAVE / a local .fwsc -> none");
   const shtml = readFileSync(new URL("./index.html", import.meta.url), "utf8");

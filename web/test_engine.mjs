@@ -305,6 +305,42 @@ for (const [o, what] of [[{ held: true }, "held by another app (open fails)"], [
   r.close();
   ok(!a.ok && a.error.code === "refused" && !b.ok && b.error.code === "refused" && dev.upgrades === 0, "refused: Bubba Machine, RemoteFM1 or the V15; nothing sent", J([a, b]));
 }
+// ---- the shipped releases (installer/releases.json as Pages serves it, its real packages): 0.2.1 is current, 0.1.1
+// older (offered the update); installing writes 0.2.1's image, its blocks counted
+{
+  const relDoc = JSON.parse(readFileSync(new URL("./installer/releases.json", import.meta.url), "utf8"));
+  const fw = (v) => new Uint8Array(readFileSync(new URL(`./installer/firmware/remote-${v}.fwsc`, import.meta.url)));
+  const raw021 = fw("0.2.1"), raw011 = fw("0.1.1");
+  const sha021 = createHash("sha256").update(raw021).digest("hex");
+  const pkg021 = await packageFrom(raw021), pkg011 = await packageFrom(raw011);
+  const BLOCKS021 = Math.ceil(pkg021.image.length / 512);
+  ok(relDoc.releases[0].version === "0.2.1" && relDoc.releases[0].latest === true && sha021 === "62a6b619c73b88248591067bd414124b288fa7628b26cc2b3895a2957f52f362"
+     && relDoc.releases[0].sha256 === sha021 && relDoc.releases.some((r) => r.version === "0.1.1"),
+     "releases.json: 0.2.1 first and latest (TuttiDAW's SHA-256), 0.1.1 still listed");
+  ok(pkg021.image.length !== pkg011.image.length || pkg021.image.some((b, i) => b !== pkg011.image[i]), "0.2.1's image is not 0.1.1's");
+  // releases: null: the engine reads releases.json itself (the route serves the file's own content)
+  const routes = { [`${BASE}remote-0.2.1.fwsc`]: raw021, [`${BASE}remote-0.1.1.fwsc`]: raw011, [V15]: raw, [RELEASES_URL]: relDoc };
+  const shipped = async (o) => { const dev = new FakeFM1(pkg021.image, o); return { dev, r: await configured({ dev, routes, releases: null }) }; };
+  let { dev, r } = await shipped({ remote: "0.1.1" });
+  m = await r.call("look", {}); r.close();
+  ok(m.ok && J(m.result.firmware) === J({ kind: "remote", version: "0.1.1", current: false }) && m.result.previous.sha256 === relDoc.releases[1].sha256,
+     "look on a 0.1.1 unit: RemoteFM1 0.1.1, not current (the update to 0.2.1 is offered)", J(m));
+  ({ dev, r } = await shipped({ remote: "0.2.1" }));
+  m = await r.call("look", {}); r.close();
+  ok(m.ok && J(m.result.firmware) === J({ kind: "remote", version: "0.2.1", current: true }) && m.result.previous.sha256 === sha021,
+     "look on a 0.2.1 unit: RemoteFM1 0.2.1, current", J(m));
+  ({ dev, r } = await shipped({ remote: "0.1.1", finalRemote: "0.2.1" }));
+  const res = await r.call("install", { target: { kind: "remote" } });
+  const writes = r.events.filter((e) => e.stage === "write");
+  ok(res.ok && J(res.result.installed.firmware) === J({ kind: "remote", version: "0.2.1", current: true }) && dev.bad === 0 && dev.upgrades === 2,
+     "install over 0.1.1: 0.2.1's image served byte for byte, the unit answers 0.2.1, current", J([res, dev.bad]));
+  ok(writes.length === 7 && writes.every((e) => e.total === BLOCKS021) && writes.map((e) => e.done).join() === "0,1,2,3,4,5,6",
+     `install 0.2.1: progress write counts 0.2.1's blocks (total ${BLOCKS021})`, J(writes));
+  const dl = r.events.filter((e) => e.stage === "download").pop();
+  ok(dl && dl.done === raw021.length && dl.total === raw021.length, `install 0.2.1: download progress ends at its ${raw021.length} B`, J(dl));
+  r.close();
+}
+
 // ---- cancel and busy, held at the sync points (no clock: each test stops the engine at a point, answers, releases)
 
 // run an install to its sync point key (null: through, no stop) -> { hit, reply, cancel, sentAtAck, trace }
