@@ -67,18 +67,19 @@ export function remoteHello(input, output, ms = 800) {
 
 // what the connected FM-1 runs -> { none } | { several, list } | { loader, identity } |
 // { identity, port, version, fw, remote: { name, proto, version } | null }; each found one also has ports: { input,
-// output } (the MIDI port names). opts.portRe: the port names probed (default fm1ota.js PORT_RE)
+// output } (the MIDI port names) and endpoints: { input, output } (the MIDIInput / MIDIOutput objects themselves: the
+// engine's endpoint session, protocol v1.1). opts.portRe: the port names probed (default fm1ota.js PORT_RE)
 export async function look(access, log = () => {}, opts = {}) {
   const up = new Updater(access, log, opts.portRe);
   const all = await up.all();
   if (!all.length) return { none: true };
   if (all.length > 1) return { several: true, list: all.map((d) => `${d.id.text} (${d.name})`) };
   const d = all[0];
-  const ports = { input: d.input.name, output: d.output.name };
-  if (/^ota-/i.test(d.id.model)) return { loader: true, identity: d.id.text, port: d.name, ports };
+  const ports = { input: d.input.name, output: d.output.name }, endpoints = { input: d.input, output: d.output };
+  if (/^ota-/i.test(d.id.model)) return { loader: true, identity: d.id.text, port: d.name, ports, endpoints };
   const remote = d.id.text === IDENTITY ? await remoteHello(d.input, d.output) : null;
   const version = remote ? null : await deviceInfo(d.input, d.output);
-  return { identity: d.id.text, port: d.name, ports, version, fw: classifyFirmware(d.id.text, version, d.name), remote };
+  return { identity: d.id.text, port: d.name, ports, endpoints, version, fw: classifyFirmware(d.id.text, version, d.name), remote };
 }
 
 // ---- the decisions, pure (no MIDI, no page): install() below, page.js and the headless engine (../engine.js) ----

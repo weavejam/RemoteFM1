@@ -34,8 +34,9 @@ serve:
 - malformed arguments get `error.code = 'refused'` with `detail` starting `bad request`, and nothing is done. For
   example: `install` without a `target` object, a `target.kind` or `config` URL that isn't a string, a
   non-boolean `resume`, an empty or non-string `portHint`, or a malformed `expect` (not an object, a `port` without
-  `input` and `output` names, a `mode` other than `'normal'` or `'update'`, a non-string `identity`, or a `firmware`
-  without a string `kind`).
+  `input` and `output` names, a `mode` other than `'normal'` or `'update'`, a non-string `identity`, a `firmware`
+  without a string `kind`, a `session` that isn't a non-empty string, or a non-boolean `confirmedSameUnit`). A
+  missing `expect.session` is not a bad request: it is `unitChanged` (`session-missing`).
 
 A message that is neither (not an object, or with no `id` and no `op`) gets no reply.
 
@@ -49,9 +50,12 @@ A message that is neither (not an object, or with no `id` and no `op`) gets no r
 - `look({ portHint? })` → `Fm1State`. Reads what is on the FM-1: the OTA identity (the update protocol's handshake),
   RemoteFM1's HELLO (only to a unit that answers as V15), the INFO backup protocol, and update mode.
   `portHint` (a MIDI port name) restricts the probe to that port. Without it, two answering FM-1s are refused.
+  v1.1: a `look` that finds a unit also opens an endpoint session on the ports it read and returns its token as
+  `session` (see [The endpoint session](#the-endpoint-session)). Each `look` ends the previous session.
 - `install({ target, resume?, expect? })` → `{ installed: Fm1State }`. `expect` (protocol v1.1) binds the install
-  to the unit the host verified: see [Protocol v1.1](#protocol-v11-install-binds-to-the-verified-unit). `target` is
-  one of:
+  to the unit the host verified: see [Protocol v1.1](#protocol-v11-install-binds-to-the-verified-unit). With `expect`
+  in normal mode, the install stops after step 1 (`unitChanged`, `continuity-lost`), and step 2 is a confirmed
+  resume. `target` is one of:
   - `{ kind: 'remote' }`: the bundled newest RemoteFM1;
   - `{ kind: 'v15' }`: the official V15, fetched from `v15Url`;
   - `{ kind: 'package', url, sha256, label }`: a restore. `sha256` (64 hex digits) is required, and the download must
@@ -81,8 +85,16 @@ v1. TuttiDAW always sends it. In v1, `install` probes the ports again after the 
 probe to the unit the host verified. A user who swaps unit A for unit B (one that holds user data) during the
 download gets B flashed without B's consent. With `expect`, the install writes only the unit the host verified.
 
+MIDI gives no hardware serial number. Two identical units, for example two FM-1s running Felucca 1.0.1, have the same
+port names, the same OTA identity and the same firmware. Nothing they answer tells them apart. So the binding rests
+on **connection continuity**: the engine writes only through the very MIDI endpoints the host's `look` read, and only
+while they have stayed connected since that `look`. Swapping two units means unplugging one, which always breaks
+continuity.
+
 ```ts
 interface InstallExpect {
+  session: string;                             // the `session` of the `look` the host verified the unit with
+  confirmedSameUnit?: boolean;                 // the user said yes to "Is this the FM-1 you were setting up?" (below)
   port: { input: string; output: string };     // the ports `look` returned for this unit
   mode: 'normal' | 'update';                   // the mode the host verified
   identity?: string;                           // the OTA identity / INFO identity `look` reported
@@ -90,42 +102,102 @@ interface InstallExpect {
 }
 ```
 
-The host builds it from its own `look` of the unit: `port`, `mode`, `identity` (`Fm1State.identity`, the handshake
-identity, new in v1.1) and `firmware`'s `kind`, `name` and `version`. When `expect` is given, the engine applies
-these rules:
+The host builds `expect` from its own `look` of the unit: `session`, `port`, `mode`, `identity` (`Fm1State.identity`,
+the handshake identity) and `firmware`'s `kind`, `name` and `version`. When `expect` is given, the engine applies these
+rules.
 
-- **Exactly one candidate unit.** There must be exactly one FM-1-family unit present at two moments: at the start of
-  the install (before the download), and again when the updater selects its device. That device is the normal port
-  for an install, or the update loader's port for a resume, whose name may differ (e.g. "Felucca Update"). The
-  updater also selects the loader it waits for after step 1, so the same count applies there. A unit counts when an
-  FM-1-family port answers the update protocol's handshake. If the updater sees a new port while it asks the others,
-  it asks that port too. Zero units is `disconnected`. More than one is `ambiguousUnit` ("unplug the other FM-1s"),
-  and nothing is sent to any of them. An FM-1 port that another app holds is `portBusy`, as in v1.
-- **Same unit.** Before the first write SysEx, the engine re-reads the unit it is about to write, with the same probes
-  as `look`. Then:
-  - Its mode must equal `expect.mode`.
-  - In normal mode its ports must equal `expect.port`.
-  - `expect.identity`, when given, must equal the handshake identity. In normal mode the INFO text also matches.
+### The endpoint session
+
+- **`look` opens a session.** A `look` that finds a unit returns an opaque `session` token (`Fm1State.session`). The
+  session holds the exact `MIDIInput` and `MIDIOutput` objects that `look` read, and their `id`s. It keeps them open
+  and listens to `statechange` on them from the `look` until the update request. Each `look` ends the session before
+  it. A `look` that finds no unit (or several) returns no `session`.
+- **`install` must carry it.** `expect.session` must be the token of the last `look`, unused:
+  - no `expect.session`: `unitChanged`, `detail: 'session-missing'`;
+  - a token from an earlier `look`, or one an install already committed with: `unitChanged`,
+    `detail: 'session-stale'`.
+
+  The engine checks the session first, before it fetches anything. A malformed token (not a string) is a `bad
+  request`.
+- **Continuity.** Each of the following breaks continuity and gives `unitChanged` with `detail: 'continuity-lost'`.
+  Nothing is written.
+  - a `disconnected` statechange on either endpoint, at any time from the `look` to the update request;
+  - an endpoint whose `state` is `disconnected`;
+  - an endpoint whose `id` changed, or whose `id` the MIDI access now lists under another port object (or not at all);
+  - a re-read of the unit that answers on other endpoints than the session's.
+
+  The engine checks continuity at the start of the install, after its re-read of the unit, at its commit, at the
+  updater's selection, and synchronously right before each update request. If the install fails before the commit
+  for any reason while continuity is broken, the reply is `unitChanged`, not the other error. The disconnect is what
+  the host needs to know.
+- **Through the validated link.** The updater does not scan the ports. The engine passes it the session's endpoint
+  objects, and it writes through those. At its selection it does the update handshake on them, then re-validates the
+  **full** expectation on the same pair with `look`'s probes: mode, identity, and firmware (`kind`, `name`, `version`,
+  from HELLO / INFO). For a loader it also checks that the loader fits the package (below). A same-name,
+  same-identity unit running other firmware is `unitChanged`.
+
+### Re-enumeration: `confirmedSameUnit`
+
+Continuity can't survive a restart. When the FM-1 restarts into its update loader, or into its new firmware, it
+re-enumerates with new endpoints. After that, only the user can say it is the same unit. So:
+
+- **A bound install stops after step 1.** With `expect` in normal mode, the engine runs step 1 (the running firmware
+  stages the loader). It waits for the loader to answer, then ends with `unitChanged`,
+  `detail: 'continuity-lost'`. The app area is not written. The unit is in update mode, and `look` reports it
+  `resumable`. The engine never chains step 2 itself.
+- **Step 2 is a resume with a fresh session and the user's yes.** After any re-enumeration, the install needs two
+  things:
+  - `expect.session` from a **fresh** `look` that the host made **after** the re-enumeration;
+  - `expect.confirmedSameUnit: true`.
+
+  The flag means the host explicitly asked the user "Is this the FM-1 you were setting up?" and got yes. Without the
+  flag (missing or `false`), the reply is `unitChanged`, `detail: 'continuity-lost'`, and nothing is sent. A re-enumeration is:
+  - step 1 → the loader for step 2;
+  - any resume: a `look` that finds update mode;
+  - any `look` after this engine instance committed a write. Each write restarts the unit, so this includes the V15
+    detour's RemoteFM1 install over the V15.
+- **The loader must fit the target.** A loader's model and identity must be one that the package supports. Otherwise
+  the install is `refused`, and nothing is written:
+  - our own loader (`fm1ota.js` `OUR_LOADER`, `ota-FM-1_7NN..9NN`) takes any FM-1 package;
+  - the official loader (`ota-FM-1_0NN`) takes M-VAVE's V15 only. RemoteFM1 then goes on through an install over the
+    V15 (the V15 → RemoteFM1 chain);
+  - another firmware's loader, or another model's (an SMK-37's), is never written.
+
+The host's flow for a normal-mode unit:
+
+1. `look`.
+2. `install({ expect })` ends with `unitChanged` / `continuity-lost` after step 1.
+3. `look` again (update mode, a new `session`).
+4. Ask the user.
+5. `install({ resume: true, expect: { ...fresh, confirmedSameUnit: true } })`.
+
+If the user says no, the host doesn't resume. It tells the user to reconnect the FM-1 it was setting up.
+
+### The other rules
+
+- **Exactly one candidate unit.** Exactly one FM-1-family unit must answer the update protocol's handshake at the
+  start of the install (before the download) and at the engine's re-read. Zero units is `disconnected`. More than one
+  is `ambiguousUnit` ("unplug the other FM-1s"), and nothing is sent to any of them. An FM-1 port that another app
+  holds is `portBusy`, as in v1. A unit plugged in after the re-read is never asked anything, because the updater
+  only uses the session's endpoints.
+- **Same unit.** The engine re-reads the unit after the download, with the same probes as `look`. The updater
+  re-reads it again on the same endpoints. Each time:
+  - its mode must equal `expect.mode`;
+  - in normal mode its ports must equal `expect.port`;
+  - `expect.identity`, when given, must equal the handshake identity (in normal mode the INFO text also matches);
   - `expect.firmware`, when given (normal mode), must match: the same `kind`, plus `name` and `version` when given.
 
-  A mismatch gives `unitChanged`, and nothing is written. The updater checks the port and the identity once more at its
-  own selection (the update's handshake, just before the update request). These checks come before the refusal
-  rules, so a unit swapped in is `unitChanged`, whatever the rules would say of it.
-  - A unit in update mode may re-enumerate as the update loader under another port name. Then the loader's identity
-    replaces the port-name check: it must be our own loader (`fm1ota.js` `OUR_LOADER`, `ota-FM-1_7NN..9NN`). Another
-    firmware's loader under another port name (the official `ota-FM-1_0NN` included) is `refused`, and nothing is
-    written. Under the port name `look` reported, the official loader still resumes the V15.
-- **Order.** The check runs after any download, immediately before the commit point. That is the same point where
-  the cancel check sits, and there is no await between the final check and setting `writing`. With `expect`, the
-  engine reads the release list before it re-reads the unit, so that re-read is the last await before the commit.
-- **Detour step 2.** The host sends a fresh `expect` from a fresh `look` after step 1. The unit then runs the V15,
-  so its firmware is not the one it ran before. The engine never chains steps on its own.
-- **Resume.** `install({ target, resume: true, expect })` takes `expect.mode = 'update'` (from `look` in update mode:
-  the loader's port and `identity`, no `firmware`). A unit found in normal mode is then `unitChanged`.
+  A mismatch is `unitChanged` (`detail` says what differs), and nothing is written. These checks come before the
+  refusal rules, so a unit swapped in is `unitChanged`, whatever the rules would say of it. A loader under another
+  port name than `expect.port` is accepted only if it is our own (`OUR_LOADER`). Any other loader there is `refused`.
+- **Order.** The engine's final check (continuity and same unit) runs after any download, immediately before the
+  commit point. The cancel check sits at the same point, and there is no await between the final check and setting
+  `writing`. With `expect`, the engine reads the release list before it re-reads the unit, so that re-read is the
+  last await before the commit. After the commit, the updater's last continuity check comes right before the update
+  request, again with no await between them.
 
-`unitChanged` and `ambiguousUnit` both mean nothing was written. The one exception is `ambiguousUnit` at the loader
-after step 1 (a second FM-1 plugged in while the first restarts into update mode). There, too, the app area is not
-written, but the unit stays in update mode: `look` then reports `resumable`.
+`unitChanged` and `ambiguousUnit` both mean nothing was written to the app area. Step 1's stop
+(`continuity-lost` after the update request) leaves the unit in update mode, and `look` then reports it `resumable`.
 
 ## Engine → host events (no `id`)
 
@@ -157,11 +229,13 @@ interface Fm1State {
   firmware: Fm1Firmware | null;                            // null when not in normal mode
   resumable: boolean;                                      // an install cut off that `install({ resume: true })` finishes
   identity?: string;                                       // v1.1: the handshake identity ("FM-1_015", "ota-FM-1_900"), for expect.identity
+  session?: string;                                        // v1.1: look only, when a unit was found: the endpoint session's token, for expect.session
   previous?: { name: string; version?: string; sha256?: string };   // what the unit ran (INFO), for the restore record
 }
 type EngineError = { code: 'firmwareUnavailable' | 'portBusy' | 'sysexDenied' | 'disconnected' | 'refused' | 'cancelled' | 'verifyFailed' | 'timeout' | 'busy' | 'internal'
                          | 'unitChanged' | 'ambiguousUnit';   // v1.1 (install with expect)
-                     detail: string; httpStatus?: number };
+                     detail: string; httpStatus?: number;
+                     message?: string };                    // v1.1: the sentence for logs when detail is a token ('continuity-lost', 'session-missing', 'session-stale')
 ```
 
 Errors are machine-readable. `detail` is for logs and "Copy details" only, and the host writes all user-facing text.
@@ -214,8 +288,8 @@ Errors are machine-readable. `detail` is for logs and "Copy details" only, and t
 | `verifyFailed` | The SHA-256 or the package check failed, or after the install the FM-1 reports another firmware than the one written. |
 | `timeout` | The loader didn't appear, stalled (before its first read or mid-write), or the FM-1 didn't come back after the write. |
 | `busy` | Another op runs, or a `cancel` came after the install committed to the write (or during `config` / `look`). |
-| `unitChanged` | v1.1, `install` with `expect`: the unit about to be written is not the one the host verified. Its mode, ports, identity or firmware differ from `expect`, either at the engine's re-read after the download or at the updater's selection. Nothing was written. Run `look` again and ask the user to confirm the unit now connected. |
-| `ambiguousUnit` | v1.1, `install` with `expect`: more than one FM-1 answers, at the start of the install or at the updater's selection (the normal port, or the loader). Nothing was written. The host asks the user to unplug the other FM-1s. |
+| `unitChanged` | v1.1, `install` with `expect`: the unit about to be written may not be the one the host verified. Nothing was written to the app area. `detail` is one of the following. `'session-missing'`: no `expect.session`. `'session-stale'`: the token is not the last `look`'s, or an install already used it. `'continuity-lost'`: the session's endpoints were disconnected, changed id or were replaced, or the unit re-enumerated and `confirmedSameUnit` is not `true`. A bound install's step 1 also ends this way, at the loader: the unit is then in update mode and `resumable`. Otherwise `detail` is a sentence: the unit's mode, ports, identity or firmware differ from `expect`, at the engine's re-read after the download or at the updater's re-validation on the same endpoints. Run `look` again, ask the user whether it is the same FM-1, and pass `confirmedSameUnit: true` with the fresh `session`. |
+| `ambiguousUnit` | v1.1, `install` with `expect`: more than one FM-1 answers, at the start of the install or at the engine's re-read. Nothing was written. The host asks the user to unplug the other FM-1s. |
 | `internal` | No `config` yet (`v15Url` / `firmwareBase` missing), an unknown, inherited, non-string or missing op, or anything unexpected. |
 
 ## Vendoring
@@ -260,18 +334,30 @@ The published site also serves the engine: `engine.html` and `engine.js` at its 
 - the stalls: step 1's (`portBusy`) and the loader's before its first read (`timeout`);
 - the dispatch: unknown, inherited, non-string and missing ops, malformed arguments, one reply per request, and no
   unhandled rejection;
-- protocol v1.1 (`expect`), on a bench of fake units that the paused-run harness swaps or adds while an install is
-  held:
-  - unit A swapped for unit B during the download is `unitChanged`, with no write SysEx to either unit. Without
-    `expect`, the same swap writes B (v1 is unchanged);
-  - a second FM-1 at the start, after the re-read, and during the updater's own scan is `ambiguousUnit`;
-  - our loader re-enumerated under another port name is accepted. Another loader under another port name is
-    `refused`;
+- protocol v1.1 (`expect`), on a bench of fake units. The paused-run harness swaps, adds or replugs units while an
+  install is held:
+  - `look` returns an opaque `session` (none when it finds no unit);
+  - unit A swapped for unit B during the download is `unitChanged` / `continuity-lost`, with no write SysEx to either
+    unit. Without `expect`, the same swap writes B (v1 is unchanged);
+  - two **identical** units (the same port names, identity and firmware) are swapped at every sync point before the
+    update request, in three ways: new port objects with new ids, new port objects under the same ids, and the very
+    same objects replugged (only the statechange tells). Every point gives `unitChanged`, and nothing is written;
+  - the updater re-selects nothing. A same-name, same-identity replacement running other firmware, swapped in at each
+    of the updater's points, is `unitChanged`. Other firmware on the same endpoints (no unplug) is refused by the
+    updater's own re-read. A second FM-1 plugged in after the commit is never asked. A source check confirms that the
+    bound `select()` scans nothing and that `alive()` comes right before the one update request;
+  - detour step 2. A's loader is replaced by B's official loader or by an identical loader:
+    - without `confirmedSameUnit`: `continuity-lost`;
+    - with a fresh session and the flag: the identical loader proceeds, and the official loader is `refused` for
+      RemoteFM1 (it takes the V15 only);
+    - the pre-step-1 session is `session-stale`, and no session is `session-missing`;
+  - a resume: without the flag `continuity-lost`, with it installed. The official loader's V15 resume is accepted, an
+    SMK loader is refused for an FM-1 package, and a loader swapped during the download is `continuity-lost`;
+  - after a write, a normal-mode install needs the flag too. v1 installs and resumes are unchanged;
+  - a second FM-1 at the start is `ambiguousUnit`;
   - firmware, version, identity and mode mismatches are `unitChanged`;
-  - a resume with `expect.mode = 'update'` works;
   - the final check sits right before `op.writing = true`, with no await from the re-read to the commit;
-  - a swap at every sync point before the update request writes nothing;
-  - the cancel tests above, run again with `expect`.
+  - the cancel tests above, run again with `expect` (a bound install's step 1, and a confirmed resume).
 
 `node web/installer/test_installer.mjs` still tests the page's decisions. CI runs both
 (`.github/workflows/installer-tests.yml` on pull requests, and the Pages build).

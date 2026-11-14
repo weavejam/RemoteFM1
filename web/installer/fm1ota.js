@@ -29,8 +29,8 @@ export const PORT_RE = /fm-1|smk|elite|mke-p37|starry|felucca|sloop|clipper|melo
 
 // errors carry a code the pages translate: notfound, model, stopped, noloader, lost, noreturn,
 // mismatch (detail: the identity the device reports), badreq, other (an SMK firmware with its own updater),
-// foreign (detail: the loader's identity); under a binding (Updater opts.bind, engine protocol v1.1): ambiguous (more
-// than one unit answers), changed (the unit is not the one bound to)
+// foreign (detail: the loader's identity); under a binding (Updater opts.bind, engine protocol v1.1): changed (the unit
+// is not the one bound to), continuity (step 1 done: the unit re-enumerated into its loader, step 2 is a resume)
 function fail(code, msg, detail = "") { const e = new Error(msg); e.code = code; e.detail = detail; return e; }
 
 export function pack7(data) {
@@ -203,9 +203,11 @@ const FM1_PORT = PORT_RE;                                       // never probe o
 export class Updater {
   // portRe: the port names probed (default PORT_RE; the engine adds firmwares' own port names, e.g. "JIANT FM").
   // opts.idleMs: { step1, write }, how long step 1 and the loader may stay silent (default 8 s and 180 s; the tests
-  // shorten them). opts.bind (engine protocol v1.1): { mode, port, identity? } (boundMismatch): the device install()
-  // and resume() select, and the loader install() waits for after step 1, must be the only unit that answers
-  // (ambiguous otherwise), and the device selected must be the bound one (changed / foreign otherwise)
+  // shorten them). opts.bind (engine protocol v1.1): { mode, port, identity?, input, output, verify?, alive? }: the
+  // device install() and resume() write is the endpoint pair input/output (no scan), whose handshake must match
+  // (boundMismatch: changed / foreign otherwise); verify(input, output) (async, throws) re-validates the whole
+  // expectation on that pair; alive() (synchronous, throws) checks the pair's continuity just before each update
+  // request. install() then stops after step 1 (code "continuity"): step 2 is a resume of its own
   constructor(access, log, portRe = FM1_PORT, opts = {}) {
     this.access = access;
     this.log = log || (() => {});
@@ -262,44 +264,46 @@ export class Updater {
     return got;
   }
 
-  // under the binding: exactly one unit answers (none -> null; several -> ambiguous, nothing sent to any) and it
-  // passes filter (else null) -> { link, id, name } | null, its link open
-  async only(filter) {
-    const got = await this.answering();
-    if (got.length > 1) {
-      got.forEach((d) => d.link.close());
-      throw fail("ambiguous", `${got.length} FM-1s answer (${got.map((d) => `${d.id.text} (${d.name})`).join(", ")}): nothing was written`);
-    }
-    const dev = got[0] || null;
-    if (dev && filter && !filter(dev.id)) { dev.link.close(); return null; }
-    return dev;
-  }
-
-  // the device install() / resume() writes: find(filter); under the binding the only unit, and the bound one
+  // the device install() / resume() writes: find(filter). Under the binding (engine protocol v1.1) there is no scan:
+  // the device is the endpoint pair the engine validated (bind.input, bind.output), asked on those very objects. Its
+  // handshake must be the bound unit's (boundMismatch), then bind.verify(input, output) re-reads it in full (mode,
+  // identity, firmware, the loader's fit) on the same pair, and the link written through is a link on that pair
   async select(filter) {
     if (!this.bind) return this.find(filter);
-    const dev = await this.only(null);
-    if (!dev) return null;
-    const why = boundMismatch(this.bind, dev);
+    const { input, output } = this.bind, alive = () => { if (this.bind.alive) this.bind.alive(); };
+    alive();
+    if (input.state === "disconnected" || output.state === "disconnected") return null;
+    try { await input.open(); await output.open(); } catch (_) { alive(); return null; }
+    let link = new Link(input, output);
+    const id = await handshake(link, 2);
+    if (!id) { link.close(); alive(); return null; }
+    const why = boundMismatch(this.bind, { id, name: input.name });
     if (why) {
-      dev.link.close();
+      link.close();
       throw fail(why, why === "foreign"
-        ? `the device is in the update mode of another firmware under another port (${dev.id.text}, ${dev.name}): nothing was written`
-        : `the device is not the one verified (${dev.id.text} on ${dev.name}, not ${this.bind.identity || this.bind.mode} on ${this.bind.port}): nothing was written`, dev.id.text);
+        ? `the device is in the update mode of another firmware under another port (${id.text}, ${input.name}): nothing was written`
+        : `the device is not the one verified (${id.text} on ${input.name}, not ${this.bind.identity || this.bind.mode} on ${this.bind.port}): nothing was written`, id.text);
     }
-    if (filter && !filter(dev.id)) { dev.link.close(); return null; }
-    return dev;
+    if (this.bind.verify) { link.close(); await this.bind.verify(input, output); link = new Link(input, output); }
+    if (filter && !filter(id)) { link.close(); return null; }
+    return { link, id, name: input.name };
   }
 
-  // single: under the binding, the only unit that answers (only())
-  async waitFor(filter, ms, single = false) {
+  async waitFor(filter, ms) {
     const end = Date.now() + ms;
     while (Date.now() < end) {
-      const dev = single ? await this.only(filter) : await this.find(filter);
+      const dev = await this.find(filter);
       if (dev) return dev;
       await sleep(1000);
     }
     return null;
+  }
+
+  // the update request: the device's commit. Under the binding, bind.alive() (synchronous: the endpoints' continuity)
+  // is the last thing before it, with no await between them
+  request(link) {
+    if (this.bind && this.bind.alive) this.bind.alive();
+    return link.send(UPGRADE);
   }
 
   // serve read requests until the device asks for one of the finish addresses; stops early
@@ -341,7 +345,7 @@ export class Updater {
     const [model] = product.split("_");
     if (dev.id.model !== model && !(anyModel && sameKeyboard(dev.id.model, model))) { dev.link.close(); throw fail("model", `the device is ${dev.id.text}, the package is for ${product}`); }
     step("start", dev.id.text);
-    dev.link.send(UPGRADE);
+    this.request(dev.link);
     await sleep(2000);
     const s1 = await this.serve(dev.link, image, 0xE0000000, this.idle.step1, (n) => step("verify", n));
     dev.link.close();
@@ -350,8 +354,16 @@ export class Updater {
     if (!s1.finished && !jumped) throw fail(s1.lost ? "lost" : "stopped", `the device ${s1.lost ? "was disconnected" : "stopped"} after ${s1.served} requests: nothing was written`);
     step("loader");
     await sleep(3000);
-    // (under the binding the loader must be the only unit that answers; its port name is its own)
-    const ota = await this.waitFor(jumped ? IS_OTA : (id) => id.model === "ota-" + model, jumped ? 15000 : 30000, !!this.bind);
+    // under the binding the restart into the loader ends the endpoints' continuity: no unit can be told from another
+    // across it, so step 2 is never chained here. Once a loader answers, the install stops ("continuity"): the host
+    // looks again (a fresh session on the loader), asks the user whether it is the same FM-1, and resumes
+    if (this.bind) {
+      const any = await this.waitFor(IS_OTA, jumped ? 15000 : 30000);
+      if (!any) throw fail("noloader", "the update loader did not appear. Replug the USB cable and look again: the device stays in update mode until it is finished.");
+      any.link.close();
+      throw fail("continuity", `the FM-1 restarted into update mode (${any.id.text} on ${any.name}): the link to the unit verified ended there. Look again, confirm it is the same FM-1, and resume`, any.id.text);
+    }
+    const ota = await this.waitFor(jumped ? IS_OTA : (id) => id.model === "ota-" + model, jumped ? 15000 : 30000);
     if (jumped && !(ota && OUR_LOADER(ota.id) && sameKeyboard(ota.id.model.replace(/^ota-/i, ""), dev.id.model) &&
                     (ota.id.model === "ota-" + model || (anyModel && sameKeyboard(ota.id.model.replace(/^ota-/i, ""), model))))) {
       if (ota) ota.link.close();
@@ -375,7 +387,7 @@ export class Updater {
   // a stall is the loader's (it may hold a part of the new image), not step 1's
   async write(ota, image, step) {
     step("writing");
-    ota.link.send(UPGRADE);
+    this.request(ota.link);
     await sleep(2000);
     const s2 = await this.serve(ota.link, image, 0xF0000000, this.idle.write, (n) => step("write", n));
     ota.link.close();
