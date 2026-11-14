@@ -13,7 +13,8 @@ import { fileURLToPath } from "node:url";
 import { install, look, describe, packageFrom, releasedPackage, IDENTITY, rfPack7, rfUnpack7 } from "./installer.js";
 
 const realTimeout = setTimeout;                    // the protocol's waits (seconds) shortened 20 times
-globalThis.setTimeout = (f, ms, ...a) => realTimeout(f, ms >= 200 ? ms / 20 : ms, ...a);
+// (a floor of 300 ms: INFO's and HELLO's answers, shortened to 75 and 40 ms, raced Windows' timer granularity)
+globalThis.setTimeout = (f, ms, ...a) => realTimeout(f, ms >= 200 ? Math.max(ms / 20, 300) : ms, ...a);
 
 let fails = 0, checks = 0;
 const ok = (cond, what) => { checks++; if (!cond) fails++; console.log(`${what.padEnd(78)} ${cond ? "ok" : "FAIL"}`); };

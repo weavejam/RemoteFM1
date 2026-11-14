@@ -12,8 +12,8 @@ import { createEngine, boot, PROTOCOL } from "./engine.js";
 import { decide, restorePathOf, stateOf, packageFrom, look } from "./installer/installer.js";
 
 const realTimeout = setTimeout;                    // the protocol's waits (seconds) shortened 20 times
-// (a floor of 150 ms: HELLO's 800 ms shortened to 40 raced Windows' timer granularity)
-globalThis.setTimeout = (f, ms, ...a) => realTimeout(f, ms >= 200 ? Math.max(ms / 20, 150) : ms, ...a);
+// (a floor of 300 ms: HELLO's 800 ms shortened to 40 raced Windows' timer granularity)
+globalThis.setTimeout = (f, ms, ...a) => realTimeout(f, ms >= 200 ? Math.max(ms / 20, 300) : ms, ...a);
 
 let fails = 0, checks = 0;
 const ok = (cond, what, more = "") => { checks++; if (!cond) fails++; console.log(`${what.padEnd(84)} ${cond ? "ok" : "FAIL " + more}`); };
@@ -76,7 +76,7 @@ const stages = (evs) => evs.filter((e) => e.event === "progress").map((e) => e.s
   const tryConnect = async (source, origin) => {
     const { port1, port2 } = new MessageChannel();
     listeners.forEach((f) => f({ source, origin, data: { type: "rfm1-engine-connect" }, ports: [port2] }));
-    const got = await new Promise((r) => { port1.onmessage = (e) => r(e.data); port1.postMessage({ id: 1, op: "config", firmwareBase: BASE }); realTimeout(() => r(null), 150); });
+    const got = await new Promise((r) => { port1.onmessage = (e) => r(e.data); port1.postMessage({ id: 1, op: "config", firmwareBase: BASE }); realTimeout(() => r(null), 1000); });
     port1.close(); port2.close();
     return got;
   };
