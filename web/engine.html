@@ -1,0 +1,10 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: GPL-3.0-only -->
+<!-- The headless RemoteFM1 installer engine (docs/ENGINE.md, protocol v1): no visible UI. A host page loads it in a
+     hidden same-origin iframe with allow="midi" and talks to it over a MessagePort. Source:
+     https://github.com/weavejam/RemoteFM1 (web/engine.html, web/engine.js, web/installer/). -->
+<html lang="en"><head><meta charset="utf-8">
+<title>RemoteFM1 engine</title>
+<meta name="robots" content="noindex">
+<script type="module" src="engine.js"></script>
+</head><body hidden></body></html>

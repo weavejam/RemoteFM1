@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: GPL-3.0-only
+# The installer and the headless engine against the simulated FM-1 (web/installer/test_installer.mjs,
+# web/test_engine.mjs), on every pull request and push that touches them. No device, no secrets; Node only.
+name: Installer tests
+
+on:
+  pull_request:
+    paths:
+      - "web/installer/**"
+      - "web/engine.html"
+      - "web/engine.js"
+      - "web/test_engine.mjs"
+      - ".github/workflows/installer-tests.yml"
+  push:
+    branches: [main]
+    paths:
+      - "web/installer/**"
+      - "web/engine.html"
+      - "web/engine.js"
+      - "web/test_engine.mjs"
+      - ".github/workflows/installer-tests.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: The installer against a simulated FM-1
+        run: node web/installer/test_installer.mjs
+      - name: The headless engine (protocol v1) through a MessagePort
+        run: node web/test_engine.mjs

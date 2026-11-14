@@ -184,14 +184,16 @@ export function pairOutput(access, input) {
 const FM1_PORT = PORT_RE;                                       // never probe other gear (the FM-1s and SMK-37s)
 
 export class Updater {
-  constructor(access, log) {
+  // portRe: the port names probed (default PORT_RE; the engine adds firmwares' own port names, e.g. "JIANT FM")
+  constructor(access, log, portRe = FM1_PORT) {
     this.access = access;
     this.log = log || (() => {});
+    this.portRe = portRe || FM1_PORT;
   }
 
   // the input ports that may be an FM-1 (connected, a name that matches)
   candidates() {
-    return [...this.access.inputs.values()].filter((p) => p.state !== "disconnected" && FM1_PORT.test(p.name || ""));
+    return [...this.access.inputs.values()].filter((p) => p.state !== "disconnected" && this.portRe.test(p.name || ""));
   }
 
   // every in/out pair with the same port name that answers the handshake (all: every one, their links closed)
