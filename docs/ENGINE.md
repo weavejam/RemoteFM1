@@ -130,6 +130,17 @@ rules.
   updater's selection, and synchronously right before each update request. If the install fails before the commit
   for any reason while continuity is broken, the reply is `unitChanged`, not the other error. The disconnect is what
   the host needs to know.
+- **During the transfer.** Continuity is still checked after the update request. The updater checks it synchronously
+  right before **every** transfer response: each data block and each completion acknowledgement (step 1's and the
+  loader's), with no await between the check and the send. On a loss it closes the link at once and never sends
+  another byte. The reply is `disconnected` with `detail: 'interrupted-write'`, not `unitChanged`, because a write was
+  in progress (below).
+- **Interrupted writes.** Once an update request has gone out, a bound install never says that nothing was written. A
+  link lost during step 1 or the loader's write (a disconnect, or a continuity check that fails) is `disconnected` /
+  `interrupted-write`. The app area may be partially programmed, and the unit is left in (or restarting into) update
+  mode, so `look` then reports it `resumable`. A loader that stalls mid-write is `timeout`, and its message says the
+  same. `unitChanged` (`continuity-lost`) is for binding failures before any write. The one exception is step 1's
+  planned stop at the loader (below), which doesn't touch the app area.
 - **Through the validated link.** The updater does not scan the ports. The engine passes it the session's endpoint
   objects, and it writes through those. At its selection it does the update handshake on them, then re-validates the
   **full** expectation on the same pair with `look`'s probes: mode, identity, and firmware (`kind`, `name`, `version`,
@@ -155,7 +166,11 @@ re-enumerates with new endpoints. After that, only the user can say it is the sa
   - step 1 → the loader for step 2;
   - any resume: a `look` that finds update mode;
   - any `look` after this engine instance committed a write. Each write restarts the unit, so this includes the V15
-    detour's RemoteFM1 install over the V15.
+    detour's RemoteFM1 install over the V15;
+  - any `look` after the engine detected a continuity loss before a write: a `disconnected` statechange on a session's
+    endpoints before its commit, or any `continuity-lost` reply. A fresh normal-mode `look` doesn't clear it, because
+    the unit that look finds can't be told from another one. The requirement stays across later sessions until an
+    install with `confirmedSameUnit: true` commits.
 - **The loader must fit the target.** A loader's model and identity must be one that the package supports. Otherwise
   the install is `refused`, and nothing is written:
   - our own loader (`fm1ota.js` `OUR_LOADER`, `ota-FM-1_7NN..9NN`) takes any FM-1 package;
@@ -198,6 +213,8 @@ If the user says no, the host doesn't resume. It tells the user to reconnect the
 
 `unitChanged` and `ambiguousUnit` both mean nothing was written to the app area. Step 1's stop
 (`continuity-lost` after the update request) leaves the unit in update mode, and `look` then reports it `resumable`.
+`disconnected` / `interrupted-write` means a write was in progress: the app area may be partially programmed. Look
+again, ask the user, and resume with `confirmedSameUnit: true`.
 
 ## Engine → host events (no `id`)
 
@@ -235,7 +252,7 @@ interface Fm1State {
 type EngineError = { code: 'firmwareUnavailable' | 'portBusy' | 'sysexDenied' | 'disconnected' | 'refused' | 'cancelled' | 'verifyFailed' | 'timeout' | 'busy' | 'internal'
                          | 'unitChanged' | 'ambiguousUnit';   // v1.1 (install with expect)
                      detail: string; httpStatus?: number;
-                     message?: string };                    // v1.1: the sentence for logs when detail is a token ('continuity-lost', 'session-missing', 'session-stale')
+                     message?: string };                    // v1.1: the sentence for logs when detail is a token ('continuity-lost', 'session-missing', 'session-stale', 'interrupted-write')
 ```
 
 Errors are machine-readable. `detail` is for logs and "Copy details" only, and the host writes all user-facing text.
@@ -282,13 +299,13 @@ Errors are machine-readable. `detail` is for logs and "Copy details" only, and t
 | `firmwareUnavailable` | The download failed: a network error (no `httpStatus`), or a response that is not 200 (`httpStatus`). Nothing was written. |
 | `portBusy` | An FM-1-named port can't be opened (another app holds it), or doesn't answer the handshake (flooded or held), or step 1 stalled after the update request (TransitFM1 0.1.1: a DAW's MIDI flooding the port). Nothing was written. This replaces "close every MIDI app". A stall once the loader is found is `timeout`. |
 | `sysexDenied` | `requestMIDIAccess({ sysex: true })` was rejected (`SecurityError` / `NotAllowedError`), or the browser has no Web MIDI. |
-| `disconnected` | No FM-1 to install on, or the port disappeared mid-install (unplugged). Run `look`: in update mode `resumable` tells whether `install({ resume: true })` finishes it. |
+| `disconnected` | No FM-1 to install on, or the port disappeared mid-install (unplugged). Run `look`: in update mode `resumable` tells whether `install({ resume: true })` finishes it. v1.1, `install` with `expect`: `detail: 'interrupted-write'` (the sentence in `message`) when the link was lost after an update request, whether by a disconnect or by a continuity check before a transfer response (a unit swapped in mid-transfer gets nothing more). A write was in progress: the app area may be partially programmed, never untouched. It is resumable: `look` again, ask the user whether it is the same FM-1, and `install({ resume: true, expect: { ...fresh, confirmedSameUnit: true } })`. |
 | `refused` | The refusal rules above, an unknown target, a resume outside update mode, or a malformed request (`detail` starts with `bad request`). |
 | `cancelled` | The install's own reply after a `cancel` was acknowledged (`{ cancelled: true }`). It always comes before the write, so nothing was written. (Earlier drafts of protocol v1 used `refused` with `detail` "cancelled…".) |
 | `verifyFailed` | The SHA-256 or the package check failed, or after the install the FM-1 reports another firmware than the one written. |
-| `timeout` | The loader didn't appear, stalled (before its first read or mid-write), or the FM-1 didn't come back after the write. |
+| `timeout` | The loader didn't appear, stalled (before its first read or mid-write), or the FM-1 didn't come back after the write. A stall mid-write may leave the app area partially programmed (resumable). |
 | `busy` | Another op runs, or a `cancel` came after the install committed to the write (or during `config` / `look`). |
-| `unitChanged` | v1.1, `install` with `expect`: the unit about to be written may not be the one the host verified. Nothing was written to the app area. `detail` is one of the following. `'session-missing'`: no `expect.session`. `'session-stale'`: the token is not the last `look`'s, or an install already used it. `'continuity-lost'`: the session's endpoints were disconnected, changed id or were replaced, or the unit re-enumerated and `confirmedSameUnit` is not `true`. A bound install's step 1 also ends this way, at the loader: the unit is then in update mode and `resumable`. Otherwise `detail` is a sentence: the unit's mode, ports, identity or firmware differ from `expect`, at the engine's re-read after the download or at the updater's re-validation on the same endpoints. Run `look` again, ask the user whether it is the same FM-1, and pass `confirmedSameUnit: true` with the fresh `session`. |
+| `unitChanged` | v1.1, `install` with `expect`: the unit about to be written may not be the one the host verified. A binding failure before any write: nothing was written to the app area (a loss once a write is in progress is `disconnected` / `interrupted-write` instead). `detail` is one of the following. `'session-missing'`: no `expect.session`. `'session-stale'`: the token is not the last `look`'s, or an install already used it. `'continuity-lost'`: the session's endpoints were disconnected, changed id or were replaced, or the unit re-enumerated and `confirmedSameUnit` is not `true`. A bound install's step 1 also ends this way, at the loader: the unit is then in update mode and `resumable`. Otherwise `detail` is a sentence: the unit's mode, ports, identity or firmware differ from `expect`, at the engine's re-read after the download or at the updater's re-validation on the same endpoints. Run `look` again, ask the user whether it is the same FM-1, and pass `confirmedSameUnit: true` with the fresh `session`. |
 | `ambiguousUnit` | v1.1, `install` with `expect`: more than one FM-1 answers, at the start of the install or at the engine's re-read. Nothing was written. The host asks the user to unplug the other FM-1s. |
 | `internal` | No `config` yet (`v15Url` / `firmwareBase` missing), an unknown, inherited, non-string or missing op, or anything unexpected. |
 
@@ -357,7 +374,17 @@ The published site also serves the engine: `engine.html` and `engine.js` at its 
   - a second FM-1 at the start is `ambiguousUnit`;
   - firmware, version, identity and mode mismatches are `unitChanged`;
   - the final check sits right before `op.writing = true`, with no await from the re-read to the commit;
-  - the cancel tests above, run again with `expect` (a bound install's step 1, and a confirmed resume).
+  - the cancel tests above, run again with `expect` (a bound install's step 1, and a confirmed resume);
+  - a swap mid-transfer. After the bound update request (step 1's, and a confirmed resume's loader), A's very
+    endpoint objects are disconnected and reconnected to B, whose updater waits for data. This runs at every transfer
+    step, with B asking for a data block and with B asking straight for the completion. Each run is `disconnected` /
+    `interrupted-write`, and nothing is sent to B. A source check confirms that every response in `serve()` goes through
+    the continuity guard;
+  - a confirmed resume unplugged mid-write is `interrupted-write` (partially programmed), not `unitChanged`;
+  - a continuity loss before a write is remembered. After it (the old session rejected, or no install in between),
+    an install on a fresh normal-mode `look` without `confirmedSameUnit` is `continuity-lost`, with no step 1. With the
+    flag, step 1 runs. Without a loss, a fresh `look` needs no flag;
+  - bad requests: a non-string `expect.session` and a non-boolean `expect.confirmedSameUnit`.
 
 `node web/installer/test_installer.mjs` still tests the page's decisions. CI runs both
 (`.github/workflows/installer-tests.yml` on pull requests, and the Pages build).

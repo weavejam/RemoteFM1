@@ -25,7 +25,7 @@ const FM1_NAME = /fm-1|felucca|sloop|jiant|choral|melodee|bubba|remotefm1/i;
 const BLOCK = 512;                                   // the loader's read size (fm1ota.js MAXDATA): write's total
 
 // extra: { httpStatus?, text? }: text is the sentence for logs when detail is a machine token (v1.1: unitChanged's
-// "continuity-lost", "session-missing", "session-stale"), sent as message
+// "continuity-lost", "session-missing", "session-stale"; disconnected's "interrupted-write"), sent as message
 export class EngineError extends Error {
   constructor(code, detail, extra = {}) { super(`${code}: ${detail}${extra.text ? ` (${extra.text})` : ""}`); this.code = code; this.detail = detail; Object.assign(this, extra); }
   toJSON() {
@@ -34,6 +34,9 @@ export class EngineError extends Error {
 }
 const CODES = new Set(["firmwareUnavailable", "portBusy", "sysexDenied", "disconnected", "refused", "cancelled", "verifyFailed", "timeout", "busy", "internal",
                        "unitChanged", "ambiguousUnit"]);
+
+// v1.1: a write cut off once programming may have begun (after an update request, with expect)
+export const interruptedWrite = (text) => new EngineError("disconnected", "interrupted-write", { text });
 
 // an error of any origin -> EngineError. stage: where the install was ("prepare" | "enter-update" | "write" | "reboot")
 export function toEngineError(e, stage = "prepare") {
@@ -53,6 +56,9 @@ export function toEngineError(e, stage = "prepare") {
     // step 1 done under the binding: the unit re-enumerated into its loader; step 2 is a resume with a fresh look's
     // session and the user's confirmation (the app area is not written)
     case "continuity": return new EngineError("unitChanged", "continuity-lost", { text: msg });
+    // under the binding, the link lost after an update request: a transfer was in progress (the unit may be partly
+    // programmed, never "untouched"); nothing more was sent. A confirmed resume finishes it
+    case "interrupted": return interruptedWrite(msg);
     default: return new EngineError("internal", msg);
   }
 }
@@ -68,6 +74,9 @@ export function createEngine({ requestMIDIAccess, fetch: fetchFn, releases = nul
   const seen = new Set();                            // the FM-1 inputs connected (port events on a change only)
   const listeners = new Set();                       // v1.1: the statechange listeners of the endpoint sessions
   let session = null, wrote = false;                 // v1.1: the last look's endpoint session; a write committed
+  // v1.1: continuity with a unit the host verified was lost before a write: every later session (a fresh look) needs
+  // the user's word (confirmedSameUnit) too, until an install with it commits
+  let mustConfirm = false;
 
   const emit = (msg) => { if (port) port.postMessage(msg); };
   const progress = (stage, done, total) => emit({ event: "progress", stage, done, total });
@@ -188,21 +197,28 @@ export function createEngine({ requestMIDIAccess, fetch: fetchFn, releases = nul
     endSession();
     const { input, output } = st.endpoints;
     const s = { token: newToken(), access: a, input, output, ids: { input: input.id, output: output.id }, lost: null, used: false,
-                // the unit has re-enumerated since anything the host verified before: it is in update mode (its loader),
-                // or this engine has written a unit (each write restarts it): the host must ask the user (confirmedSameUnit)
-                reenumerated: !!st.loader || wrote };
+                // the host must ask the user (confirmedSameUnit), why: the unit has re-enumerated since anything the host
+                // verified before (it is in update mode, or this engine wrote a unit: each write restarts it), or the
+                // continuity of an earlier session was lost before a write (mustConfirm)
+                reenumerated: wrote ? "this engine wrote a unit (each write restarts it)" : st.loader ? "the unit is in update mode (it re-enumerated)"
+                  : mustConfirm ? "continuity with the unit verified earlier was lost (a later look cannot tell it is the same unit)" : null };
+    const lose = (why) => { s.lost = why; if (!s.used) mustConfirm = true; };
     s.on = (ev) => {
       const p = ev && ev.port;
       if (!p || s.lost || p.state !== "disconnected") return;
-      if (p === s.input || p === s.output || p.id === s.ids.input || p.id === s.ids.output) s.lost = `the port "${p.name}" (${p.type}) was disconnected`;
+      if (p === s.input || p === s.output || p.id === s.ids.input || p.id === s.ids.output) lose(`the port "${p.name}" (${p.type}) was disconnected`);
     };
-    if (lostIds.has(s.ids.input) || lostIds.has(s.ids.output)) s.lost = `the port "${input.name}" was disconnected while look read it`;
+    if (lostIds.has(s.ids.input) || lostIds.has(s.ids.output)) lose(`the port "${input.name}" was disconnected while look read it`);
     listeners.add(s.on);
     session = s;
     return s;
   }
-  const continuityLost = (why) => new EngineError("unitChanged", "continuity-lost",
-    { text: `${why}: the unit look verified cannot be told from another one (nothing was written). Look again and ask the user whether it is the same FM-1` });
+  // (every detection: from now on a fresh look's session needs confirmedSameUnit too, until a confirmed install)
+  const continuityLost = (why) => {
+    mustConfirm = true;
+    return new EngineError("unitChanged", "continuity-lost",
+      { why, text: `${why}: the unit look verified cannot be told from another one (nothing was written). Look again and ask the user whether it is the same FM-1` });
+  };
   // synchronous: look's endpoints, connected all along, still the ones the access lists under their ids
   function holds(s) {
     if (s.lost) throw continuityLost(s.lost);
@@ -221,7 +237,7 @@ export function createEngine({ requestMIDIAccess, fetch: fetchFn, releases = nul
     if (!session || session.token !== expect.session || session.used)
       throw new EngineError("unitChanged", "session-stale", { text: "expect.session is not the last look's (a later look, or an install used it): look again" });
     if (session.reenumerated && expect.confirmedSameUnit !== true)
-      throw continuityLost("the unit re-enumerated (update mode, or restarted by a write) and expect.confirmedSameUnit is not true");
+      throw continuityLost(`${session.reenumerated} and expect.confirmedSameUnit is not true`);
     holds(session);
     return session;
   }
@@ -401,6 +417,7 @@ export function createEngine({ requestMIDIAccess, fetch: fetchFn, releases = nul
     op.writing = true;
     log("install: commit");
     wrote = true;                                      // (every look from now on is after a re-enumeration)
+    if (expect && expect.confirmedSameUnit === true) mustConfirm = false;   // (the user's word: a confirmed install)
     if (s) s.used = true; else endSession();
     if (d.action === "install") previous = prev;
     const total = Math.ceil(pkg.image.length / BLOCK);
@@ -434,7 +451,10 @@ export function createEngine({ requestMIDIAccess, fetch: fetchFn, releases = nul
       if (d.action === "resume") {
         const ok = await up.resume(pkg.image, step, pkg.official ? { product: pkg.product } : { package: pkg.product });
         if (!ok) {
-          if (s) holds(s);
+          // bound: once the loader's update request went out, programming may have begun: an interrupted write, never
+          // the pre-write binding failure ("nothing was written"). (The bound updater throws "interrupted" itself.)
+          if (s && up.requested) throw interruptedWrite(`the write of ${pkg.label} did not finish after its update request: the app area may be partially programmed. Look again, ask the user whether it is the same FM-1, and resume`);
+          if (s) holds(s);                             // (nothing was sent to the loader: a pre-write binding failure)
           const gone = !(await lookFm1(acc, log, { portRe: ENGINE_PORT_RE })).loader;
           throw new EngineError(gone ? "disconnected" : "timeout", `the write of ${pkg.label} did not finish`);
         }

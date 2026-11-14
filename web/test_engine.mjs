@@ -645,8 +645,8 @@ const officialLoader = (o = {}) => new FakeFM1(pkg.image, { identity: "ota-FM-1_
   const boundSel = sel.slice(sel.indexOf("if (!this.bind) return this.find(filter);") + "if (!this.bind) return this.find(filter);".length);
   const req = ota.slice(ota.indexOf("  request(link) {"), ota.indexOf("  // serve read requests"));
   ok(!/this\.(find|all|answering|candidates)\(/.test(boundSel) && /this\.bind\.verify\(input, output\)/.test(boundSel) && /new Link\(input, output\)/.test(boundSel) &&
-     /this\.bind\.alive\(\);\s*return link\.send\(UPGRADE\);/.test(req) && (ota.match(/send\(UPGRADE\)/g) || []).length === 1,
-     "v1.1 (source): the bound updater asks only the session's endpoints and re-validates on them; alive() is right before the one update request", boundSel);
+     /this\.bind\.alive\(\);\s*this\.requested\+\+;\s*return link\.send\(UPGRADE\);/.test(req) && (ota.match(/send\(UPGRADE\)/g) || []).length === 1,
+     "v1.1 (source): the bound updater asks only the session's endpoints and re-validates on them; alive() is right before the one update request (a counter only between)", boundSel);
 }
 {   // HIGH 3: step 2 of the detour (after step 1 the unit restarts into its loader; continuity cannot survive it).
     // A's loader replaced by B's: without confirmedSameUnit, unitChanged / continuity-lost; with a fresh session and
@@ -764,6 +764,81 @@ const officialLoader = (o = {}) => new FakeFM1(pkg.image, { identity: "ota-FM-1_
      /check\(\);\s*if \(expect\) bound\(st, expect, s, pkg\);\s*$/.test(between) && /const ctx = expect \? await context\(\) : null;\s*check\(\);\s*\/\/[^\n]*\n\s*const st = await probe/.test(src),
      "v1.1: the final continuity / same-unit check is right before op.writing = true; no await from the re-read to the commit", between);
 }
+// interrupted: a write cut off after its update request (the app area may be partly programmed): never "nothing written"
+const interrupted = (x) => !!x && !x.ok && x.error.code === "disconnected" && x.error.detail === "interrupted-write" &&
+  !/nothing was written|untouched/i.test(x.error.message || "");
+{   // a swap mid-transfer: after the bound update request (step 1's, or a confirmed resume's loader), A's very endpoint
+    // objects are disconnected and reconnected to B, whose updater waits for data (the reviewer's case: a browser that
+    // reuses the MIDIPort objects). At every transfer step, B asking for a data block or straight for the completion:
+    // the continuity check right before each response stops it. disconnected / interrupted-write, and not one byte to B
+  const STEP1 = [[0, 64], [0x40, 160], [0x1000, 512], [0xE0000000, 8]], LOADER = [...Array.from({ length: 6 }, (_, k) => [k * 512, 512]), [0xF0000000, 8]];
+  const rewire = (a, b, finish) => (bn) => {
+    bn.flap(a); a.mute = true;                              // (A's objects disconnected and reconnected: A answers no more)
+    b.input = a.input; a.output.send = b.output.send;       // (and they carry B now)
+    const q = b.identity.startsWith("ota-") ? LOADER : STEP1;
+    b.queue = finish ? q.slice(-1) : q.slice(); b.next();   // (B asks: a data block, or the completion)
+  };
+  // the transfer steps of a run: the update request and each data block but the last (each is answered next)
+  const stepsOf = (trace, up) => { const k = trace.indexOf(up), d = []; for (let i = k + 1; i < trace.length && trace[i].startsWith("rx data#"); i++) d.push(trace[i]); return [up, ...d.slice(0, -1)]; };
+  for (const [what, mk, args, confirm, up] of [
+    ["step 1 (normal mode)", () => [unitA(), unitA()], { target: { kind: "remote" } }, undefined, "rx upgrade#1"],
+    ["a confirmed resume (the loader's write)", () => [ourLoader(), ourLoader()], { target: { kind: "remote" }, resume: true }, true, "rx upgrade#1"],
+  ]) {
+    const [r0] = mk(), ref = await bound({ units: [r0], args, confirm });
+    const steps = stepsOf(ref.trace, up);
+    ok(steps.length >= 4 && (confirm ? ref.reply.ok : lost(ref.reply)), `v1.1 mid-transfer swap, ${what}: the reference run (${steps.length} transfer steps)`, J([ref.reply, steps]));
+    const badMid = [];
+    let n = 0;
+    for (const key of steps) for (const finish of [false, true]) {
+      const [a, b] = mk(), t = await bound({ units: [a, b], plugged: [a], args, confirm, at: key, act: rewire(a, b, finish) });
+      n++;
+      if (!t.hit || !interrupted(t.reply) || b.sent.length || b.served || b.writes.length || a.writes.length) badMid.push([key, finish, t.reply, b.sent, b.writes]);
+    }
+    ok(badMid.length === 0, `v1.1 mid-transfer swap, ${what}: B at each of ${n} steps (data, completion): interrupted-write, nothing sent to B`, J(badMid.slice(0, 2)));
+  }
+  // and in source: serve() answers only through the guarded send (no bare link.send(response(...)))
+  const ota = readFileSync(new URL("./installer/fm1ota.js", import.meta.url), "utf8");
+  const serve = ota.slice(ota.indexOf("  async serve("), ota.indexOf("  interrupted(finishAddr"));
+  ok(!/link\.send\(response/.test(serve) && (serve.match(/respond\(response/g) || []).length === 2 && /const respond = \(bytes\) => \{ guard\(\); return link\.send\(bytes\); \};/.test(serve),
+     "v1.1 (source): every transfer response in serve() goes through the synchronous continuity guard", serve.slice(0, 400));
+}
+{   // a failed resume after its data began: an interrupted write (resumable), never unitChanged / "nothing was written"
+  const l = ourLoader({ unplugAt: 3 }), t = await bound({ units: [l], args: { target: { kind: "remote" }, resume: true }, confirm: true });
+  ok(interrupted(t.reply) && l.loaderReads === 3 && /partially programmed/.test(t.reply.error.message) && t.events.some((e) => e.stage === "write" && e.done > 0),
+     "v1.1: a confirmed resume unplugged mid-write: disconnected/interrupted-write (partly programmed), not unitChanged", J(t.reply));
+  // v1 (no expect): the same unplug stays disconnected with its sentence
+  const l1 = ourLoader({ unplugAt: 3 }), t1 = await bound({ units: [l1], args: { target: { kind: "remote" }, resume: true }, expect: false });
+  ok(code(t1) === "disconnected" && t1.reply.error.detail !== "interrupted-write", "v1 (expect absent): a resume unplugged mid-write: disconnected, as before", J(t1.reply));
+}
+{   // a continuity break before a write is remembered across the session replacement: a fresh normal-mode look does not
+    // forget it. The confirmation is required until an install with it commits
+  const flapThen = async (rejectOld) => {
+    const a = unitA(), bn = bench([a]), r = await configured({ dev: bn });
+    const l0 = await r.call("look", {});
+    bn.flap(a);                                                         // (disconnected and reconnected)
+    const old = rejectOld ? await r.call("install", { target: { kind: "remote" }, expect: expectOf(l0.result) }) : null;
+    await r.call("look", {});                                           // (looks again, and again: still remembered)
+    const l1 = await r.call("look", {});
+    const bare = await r.call("install", { target: { kind: "remote" }, expect: expectOf(l1.result) });
+    const upBare = a.upgrades + a.sent.filter((k) => k === "upgrade").length;
+    const l2 = await r.call("look", {});
+    const yes = await r.call("install", { target: { kind: "remote" }, expect: { ...expectOf(l2.result), confirmedSameUnit: true } });
+    r.close();
+    return { a, old, l1, bare, upBare, yes };
+  };
+  const t = await flapThen(true);
+  ok(lost(t.old) && t.l1.result.mode === "normal" && lost(t.bare) && /continuity/.test(t.bare.error.message) && t.upBare === 0,
+     "v1.1: continuity lost, the old session rejected, a fresh normal-mode look: a retry without confirmedSameUnit is continuity-lost, no step 1", J([t.old, t.bare]));
+  ok(lost(t.yes) && t.a.upgrades === 1 && t.a.writes.length === 0, "v1.1: ... and with confirmedSameUnit (the user's yes) on a fresh look: step 1 proceeds", J(t.yes));
+  const t2 = await flapThen(false);
+  ok(lost(t2.bare) && t2.upBare === 0 && t2.a.upgrades === 1, "v1.1: the session's ports disconnected and reconnected (no install in between), a fresh look: confirmation still required", J(t2.bare));
+  // control: no loss, two looks: no confirmation needed (step 1 runs)
+  const c = unitA(), bn = bench([c]), r = await configured({ dev: bn });
+  await r.call("look", {});
+  const l = await r.call("look", {}), res = await r.call("install", { target: { kind: "remote" }, expect: expectOf(l.result) });
+  r.close();
+  ok(lost(res) && /update mode/.test(res.error.message) && c.upgrades === 1, "v1.1: without a continuity loss, a fresh look needs no confirmation (step 1 runs)", J(res));
+}
 // ---- stalls: step 1's (nothing written: portBusy) and the loader's, before its first read (timeout)
 {
   const dev = new FakeFM1(pkg.image, { stall: true }), r = await configured({ dev, idleMs: IDLE });
@@ -804,7 +879,12 @@ const officialLoader = (o = {}) => new FakeFM1(pkg.image, { identity: "ota-FM-1_
                     ["install", { target: { kind: "remote" }, expect: 5 }], ["install", { target: { kind: "remote" }, expect: { port: "FM-1", mode: "normal" } }],
                     ["install", { target: { kind: "remote" }, expect: { port: { input: "FM-1", output: "FM-1" }, mode: "uboot" } }],
                     ["install", { target: { kind: "remote" }, expect: { port: { input: "FM-1", output: "FM-1" }, mode: "normal", identity: 15 } }],
-                    ["install", { target: { kind: "remote" }, expect: { port: { input: "FM-1", output: "FM-1" }, mode: "normal", firmware: { name: "x" } } }]];
+                    ["install", { target: { kind: "remote" }, expect: { port: { input: "FM-1", output: "FM-1" }, mode: "normal", firmware: { name: "x" } } }],
+                    // a non-string session and a non-boolean confirmedSameUnit (a missing session is unitChanged, not these)
+                    ["install", { target: { kind: "remote" }, expect: { port: { input: "FM-1", output: "FM-1" }, mode: "normal", session: 5 } }],
+                    ["install", { target: { kind: "remote" }, expect: { port: { input: "FM-1", output: "FM-1" }, mode: "normal", session: { token: "x" } } }],
+                    ["install", { target: { kind: "remote" }, expect: { port: { input: "FM-1", output: "FM-1" }, mode: "normal", session: "s", confirmedSameUnit: "yes" } }],
+                    ["install", { target: { kind: "remote" }, expect: { port: { input: "FM-1", output: "FM-1" }, mode: "normal", session: "s", confirmedSameUnit: 1 } }]];
   ARGS_BAD.forEach(([op, a], k) => raw({ ...a, id: `args-${k}`, op }));
   r.post("install"); r.post(null); r.post(7); r.post({ foo: 1 });             // not requests: no id, no op
   const last = await r.send("config", {});                                   // (answered after every one above)
