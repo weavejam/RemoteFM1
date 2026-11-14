@@ -3,7 +3,10 @@
 // MessageChannel) against the simulated FM-1 of installer/fake_fm1.mjs and a fake fetch: the handshake, look for each
 // firmware and mode, a direct install, the V15 detour (refused direct, V15, then RemoteFM1), resume from update mode,
 // the errors (firmwareUnavailable on a 404 and a network error, portBusy, sysexDenied, disconnected mid-write, busy,
-// refused, cancel) and the progress order. Plus installer.js's pure decisions. Never against a real unit.
+// refused, cancelled, timeout on a loader's stall) and the progress order; a cancel at every sync point before and
+// after the commit to the write (no write SysEx after an acknowledged cancel); the dispatch (unknown, inherited,
+// non-string and missing ops, malformed arguments: one reply each). Plus installer.js's pure decisions. Never against
+// a real unit.
 //   node web/test_engine.mjs
 import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
@@ -11,9 +14,40 @@ import { FakeFM1 } from "./installer/fake_fm1.mjs";
 import { createEngine, boot, PROTOCOL } from "./engine.js";
 import { decide, restorePathOf, stateOf, packageFrom, look } from "./installer/installer.js";
 
-const realTimeout = setTimeout;                    // the protocol's waits (seconds) shortened 20 times
-// (a floor of 300 ms: HELLO's 800 ms shortened to 40 raced Windows' timer granularity)
-globalThis.setTimeout = (f, ms, ...a) => realTimeout(f, ms >= 200 ? Math.max(ms / 20, 300) : ms, ...a);
+const realTimeout = setTimeout, realClear = clearTimeout;
+// The protocol's waits (seconds) shortened 20 times, with a floor of 300 ms (HELLO's 800 ms shortened to 40 raced
+// Windows' timer granularity). The engine's timers can be frozen: while a test holds the engine at a sync point
+// (below), a timer that comes due waits for the release, so the engine moves only on a message (a cancel), never on
+// the clock. (The fake FM-1 and the fake fetch keep the real setTimeout.)
+let frozen = null;
+class Timer { constructor() { this.cleared = false; this.t = null; } }
+globalThis.setTimeout = (f, ms, ...a) => {
+  const h = new Timer();
+  const run = () => { if (!h.cleared) f(...a); };
+  h.t = realTimeout(() => { if (frozen) frozen.push(run); else run(); }, ms >= 200 ? Math.max(ms / 20, 300) : ms);
+  return h;
+};
+globalThis.clearTimeout = (h) => { if (h instanceof Timer) { h.cleared = true; realClear(h.t); } else realClear(h); };
+
+// The sync points: every place the engine waits on the outside world calls point(label): a fetch, the MIDI access, a
+// port's open, a message the fake FM-1 takes, the SHA-256 (crypto.subtle.digest). sync.trace: the labels, numbered
+// ("rx hs#2": the second handshake). With sync.target set, the run stops at that point: the engine's timers frozen,
+// sync.hit({ key, release }) called; release() lets it go on.
+const sync = { trace: [], target: null, hit: null };
+async function point(label) {
+  const n = sync.trace.filter((k) => k.startsWith(label + "#")).length + 1, key = `${label}#${n}`;
+  sync.trace.push(key);
+  if (sync.target !== key) return;
+  sync.target = null;
+  frozen = [];
+  await new Promise((release) => sync.hit({ key, release }));
+  const due = frozen; frozen = null;
+  due.forEach((f) => f());
+}
+const realDigest = crypto.subtle.digest.bind(crypto.subtle);
+crypto.subtle.digest = async (...a) => { await point("digest"); return realDigest(...a); };
+let unhandled = 0;
+process.on("unhandledRejection", (e) => { unhandled++; console.log("unhandled rejection:", e); });
 
 let fails = 0, checks = 0;
 const ok = (cond, what, more = "") => { checks++; if (!cond) fails++; console.log(`${what.padEnd(84)} ${cond ? "ok" : "FAIL " + more}`); };
@@ -29,37 +63,47 @@ const V15_SHA = sha;
 const pkg = await packageFrom(raw);
 const BLOCKS = Math.ceil(pkg.image.length / 512);
 
-// a fake fetch: url -> bytes | status | "network" (throws, as fetch does offline) | { delay, bytes }
+// a fake fetch: url -> bytes | status | "network" (throws, as fetch does offline) | an object (JSON). Each call is a
+// sync point ("fetch <file name>"); an aborted signal rejects as fetch does
+const RELEASES_URL = new URL("./installer/releases.json", import.meta.url).href;
 function fakeFetch(routes) {
   const calls = [];
   const f = async (url, init = {}) => {
     calls.push(url);
+    await point(`fetch ${url.split("/").pop()}`);
+    if (init.signal && init.signal.aborted) throw Object.assign(new Error("aborted"), { name: "AbortError" });
     let r = routes[url];
-    if (r && r.delay) { await new Promise((res, rej) => { const t = realTimeout(res, r.delay); if (init.signal) init.signal.addEventListener("abort", () => { clearTimeout(t); rej(Object.assign(new Error("aborted"), { name: "AbortError" })); }); }); r = r.bytes; }
     if (r === "network") throw new TypeError("Failed to fetch");
     if (r === undefined) r = 404;
     if (typeof r === "number") return { ok: false, status: r, headers: new Map(), arrayBuffer: async () => new ArrayBuffer(0) };
+    if (!(r instanceof Uint8Array)) return { ok: true, status: 200, headers: new Map(), json: async () => r };
     return { ok: true, status: 200, headers: new Map([["content-length", String(r.length)]]), arrayBuffer: async () => r.slice().buffer };
   };
   f.calls = calls;
   return f;
 }
-const ROUTES = { [`${BASE}remote-9.9.fwsc`]: raw, [V15]: raw };
+const ROUTES = { [`${BASE}remote-9.9.fwsc`]: raw, [V15]: raw, [RELEASES_URL]: { releases: RELEASES } };
 
-// an engine on a port; call(op, args) -> the final reply; events: every event since the last call
-function rig({ dev = null, routes = ROUTES, midi, releases = RELEASES } = {}) {
+// an engine on a port; call(op, args) -> the final reply; events: every event since the last call; replies: every
+// reply, in order. The MIDI access is a sync point ("midi"), and so are the fake FM-1's ports and messages
+function rig({ dev = null, routes = ROUTES, midi, releases = RELEASES, idleMs } = {}) {
   const { port1, port2 } = new MessageChannel();
-  const engine = createEngine({ requestMIDIAccess: midi || (async () => dev.access), fetch: fakeFetch(routes), releases, v15Sha256: V15_SHA });
+  if (dev && dev.gate === null) dev.gate = (kind) => point(kind === "open" ? "open" : `rx ${kind}`);
+  const engine = createEngine({ requestMIDIAccess: midi || (async () => { await point("midi"); return dev.access; }), fetch: fakeFetch(routes), releases,
+                                v15Sha256: V15_SHA, idleMs });
   engine.attach(port2);
-  const waiting = new Map(), events = [];
+  const waiting = new Map(), events = [], replies = [];
   let n = 0;
   port1.onmessage = (ev) => {
     const m = ev.data;
-    if (m.event) events.push(m);
-    else if (waiting.has(m.id)) { waiting.get(m.id)(m); waiting.delete(m.id); }
+    if (m.event) { events.push(m); return; }
+    replies.push(m);
+    if (waiting.has(m.id)) { waiting.get(m.id)(m); waiting.delete(m.id); }
   };
   const send = (op, args = {}) => { const id = ++n; const p = new Promise((r) => waiting.set(id, r)); port1.postMessage({ id, op, ...args }); return p; };
-  return { send, events, close: () => { port1.close(); port2.close(); },
+  // any message (not a request of send's): post it raw
+  const post = (msg) => port1.postMessage(msg);
+  return { send, post, events, replies, engine, close: () => { port1.close(); port2.close(); },
            async call(op, args) { events.length = 0; return send(op, args); } };
 }
 const configured = async (o) => { const r = rig(o); await r.call("config", { v15Url: V15, firmwareBase: BASE.slice(0, -1) }); return r; };
@@ -157,8 +201,8 @@ ok(m.ok && m.result.mode === "update" && m.result.resumable, "look: the official
   ok(res.ok && res.result.installed.firmware.kind === "remote" && res.result.installed.firmware.current && dev.upgrades === 2 && dev.bad === 0,
      "install remote over stock: installed, both steps served right, confirmed by HELLO", J(res));
   ok(J(st) === J(["download", "verify", "enter-update", "write", "reboot", "confirm"]), "progress: download, verify, enter-update, write, reboot, confirm", J(st));
-  ok(writes.length === 6 && writes.every((e) => e.total === BLOCKS) && writes.map((e) => e.done).join() === "1,2,3,4,5,6",
-     `progress: write counts blocks (done 1..6 of ${BLOCKS})`, J(writes));
+  ok(writes.length === 7 && writes.every((e) => e.total === BLOCKS) && writes.map((e) => e.done).join() === "0,1,2,3,4,5,6",
+     `progress: write counts blocks (done 0..6 of ${BLOCKS}: 0 once the loader is found)`, J(writes));
   ok(r.events.filter((e) => e.event === "progress").every((e) => typeof e.done === "number" && typeof e.total === "number"), "progress: every event has done and total");
   ok(r.events.some((e) => e.event === "port" && e.state === "lost") && r.events.some((e) => e.event === "port" && e.state === "found"),
      "port events: lost and found while the FM-1 restarts");
@@ -236,12 +280,6 @@ for (const [o, what] of [[{ held: true }, "held by another app (open fails)"], [
   ok(!l.ok && l.error.code === "portBusy" && !i.ok && i.error.code === "portBusy" && dev.upgrades === 0, `portBusy: the port ${what}: look and install`, J([l, i]));
 }
 {
-  const dev = new FakeFM1(pkg.image, { stall: true }), r = await configured({ dev });
-  const res = await r.call("install", { target: { kind: "remote" } });
-  r.close();
-  ok(!res.ok && res.error.code === "portBusy" && dev.writes.length === 0, "portBusy: step 1 stalls after UPGRADE (TransitFM1 0.1.1): nothing written", J(res));
-}
-{
   const dev = new FakeFM1(pkg.image, { unplugAt: 3 }), r = await configured({ dev });
   const res = await r.call("install", { target: { kind: "remote" } });
   const after = await r.call("look", {});
@@ -263,36 +301,177 @@ for (const [o, what] of [[{ held: true }, "held by another app (open fails)"], [
   r.close();
   ok(!a.ok && a.error.code === "refused" && !b.ok && b.error.code === "refused" && dev.upgrades === 0, "refused: Bubba Machine, RemoteFM1 or the V15; nothing sent", J([a, b]));
 }
-{   // busy: a second install while one runs; a cancel once the write started
-  const dev = new FakeFM1(pkg.image, { finalRemote: "9.9" }), r = await configured({ dev });
-  r.events.length = 0;
-  const first = r.send("install", { target: { kind: "remote" } });
-  const second = await r.send("install", { target: { kind: "remote" } });
-  const lookMid = await r.send("look", {});
-  ok(!second.ok && second.error.code === "busy" && !lookMid.ok && lookMid.error.code === "busy", "busy: a second install (and a look) while one runs", J([second, lookMid]));
-  while (!r.events.some((e) => e.stage === "write")) await new Promise((res) => realTimeout(res, 5));
-  const c = await r.send("cancel", {});
-  ok(!c.ok && c.error.code === "busy", "cancel once the write started: busy", J(c));
-  const f = await first;
-  ok(f.ok && dev.bad === 0, "  ...and the install finishes", J(f));
+// ---- cancel and busy, held at the sync points (no clock: each test stops the engine at a point, answers, releases)
+
+// run an install to its sync point key (null: through, no stop) -> { hit, reply, cancel, sentAtAck, trace }
+// whileHeld(r, dev): what the host does while the engine is held there (default: a cancel)
+const IDLE = { step1: 1000, write: 1000 };            // (the stall tests: how long a silent FM-1 is waited for)
+async function installHeld(scn, key, whileHeld = async (r) => ({ cancel: await r.send("cancel", {}) })) {
+  const dev = scn.dev(), r = await configured({ dev, releases: null });
+  sync.trace = []; sync.target = key;
+  const hit = key ? new Promise((res) => { sync.hit = res; }) : null;
+  const inst = r.send("install", scn.args);
+  const h = key ? await Promise.race([hit, inst.then(() => null)]) : null;
+  let held = {}, sentAtAck = null;
+  if (h) {
+    held = await whileHeld(r, dev);
+    sentAtAck = dev.sent.length;
+    h.release();
+  }
+  const reply = await inst;
+  sync.target = null;
+  const trace = sync.trace.slice();
   r.close();
+  return { hit: !!h, reply, ...held, sentAtAck, dev, trace };
 }
-{   // cancel before the write: during the download
-  const dev = new FakeFM1(pkg.image, {}), r = await configured({ dev, routes: { [`${BASE}remote-9.9.fwsc`]: { delay: 300, bytes: raw } } });
-  const first = r.send("install", { target: { kind: "remote" } });
-  await new Promise((res) => realTimeout(res, 20));
-  const c = await r.send("cancel", {}), f = await first;
+// the sync points of a run before the second update request (the loader's; the resume's first) and where the commit
+// to the write is: the update's own handshake (its find(): the last port opened before the first update request)
+function pointsOf(trace, upgrades) {
+  const upAt = trace.findIndex((k) => k === `rx upgrade#${upgrades}`);
+  const head = trace.slice(0, upAt + 1).filter((k) => !k.startsWith("rx data"));
+  const firstUp = head.findIndex((k) => k === "rx upgrade#1");
+  let commit = firstUp;
+  while (commit > 0 && !head[commit - 1].startsWith("open")) commit--;
+  while (commit > 0 && head[commit - 1].startsWith("open")) commit--;
+  return { head, commit };
+}
+const WRITE_KINDS = ["upgrade", "data"];
+const SCENARIOS = [
+  // the V15 detour's two installs, each its own op: the V15 over SLOOP (its context() fetches releases.json last,
+  // after the look: the review's case), then RemoteFM1 over the V15 the unit then runs
+  { what: "detour 1: the V15 over SLOOP", args: { target: { kind: "v15" } }, upgrades: 2,
+    dev: () => new FakeFM1(pkg.image, { identity: "FM-1_900", name: "Felucca", version: "FELUCCA SLOOP 2.2", final: "FM-1_015", finalRemote: null }) },
+  { what: "detour 2: RemoteFM1 over the V15", args: { target: { kind: "remote" } }, upgrades: 2,
+    dev: () => new FakeFM1(pkg.image, { finalRemote: "9.9" }) },
+  { what: "a package (restore) over stock", args: { target: { kind: "package", url: `${BASE}remote-9.9.fwsc`, sha256: sha, label: "x" } }, upgrades: 2,
+    dev: () => new FakeFM1(pkg.image, { finalRemote: "9.9" }) },
+  { what: "resume from update mode", args: { target: { kind: "remote" }, resume: true }, upgrades: 1,
+    dev: () => new FakeFM1(pkg.image, { identity: "ota-FM-1_900", name: "Felucca Update", finalRemote: "9.9" }) },
+];
+for (const scn of SCENARIOS) {
+  const ref = await installHeld(scn, null);
+  const { head, commit } = pointsOf(ref.trace, scn.upgrades);
+  ok(ref.reply.ok && ref.dev.bad === 0 && commit > 0 && head.length > commit, `cancel, ${scn.what}: the run through (${commit} points before the write, ${head.length - commit} after)`,
+     J([ref.reply, head]));
+  let pre = 0, post = 0;
+  const bad = [];
+  for (let k = 0; k < head.length; k++) {
+    const t = await installHeld(scn, head[k]);
+    const after = t.sentAtAck === null ? [] : t.dev.sent.slice(t.sentAtAck);
+    if (k < commit) {
+      // before the write: the cancel is acknowledged, the install ends cancelled, and no write SysEx ever leaves
+      const good = t.hit && t.cancel.ok && t.cancel.result.cancelled === true && !t.reply.ok && t.reply.error.code === "cancelled" &&
+                   /^cancelled/.test(t.reply.error.detail) && !after.some((x) => WRITE_KINDS.includes(x)) && t.dev.upgrades === 0 && t.dev.served === 0;
+      if (good) pre++; else bad.push([head[k], t.cancel, t.reply, after]);
+    } else {
+      // after the commit: busy, never "cancelled", and the install finishes
+      const good = t.hit && !t.cancel.ok && t.cancel.error.code === "busy" && t.reply.ok && t.dev.bad === 0;
+      if (good) post++; else bad.push([head[k], t.cancel, t.reply]);
+    }
+  }
+  ok(pre === commit, `cancel, ${scn.what}: at each of the ${commit} points before the write: cancelled, no write SysEx after the ack`, J(bad));
+  ok(post === head.length - commit, `cancel, ${scn.what}: at each of the ${head.length - commit} after (to the loader's UPGRADE): busy, the install finishes`, J(bad));
+}
+{   // the review's case by name: a cancel while context() fetches releases.json, after the look, just before the write
+  const scn = SCENARIOS[0];
+  const t = await installHeld(scn, "fetch releases.json#1");
+  ok(t.hit && t.cancel.ok && t.cancel.result.cancelled && !t.reply.ok && t.reply.error.code === "cancelled" && t.dev.upgrades === 0 && t.dev.sent.every((x) => !WRITE_KINDS.includes(x)) &&
+     t.trace.includes("rx hs#1"), "cancel during the last await before the write (context(): releases.json): cancelled, nothing written", J([t.cancel, t.reply, t.dev.sent]));
+}
+{   // busy: a second install, a look, a cancel while held at step 1's update request and at the loader's
+  const scn = SCENARIOS[1];
+  const t = await installHeld(scn, "rx upgrade#1", async (r) => ({
+    second: await r.send("install", { target: { kind: "remote" } }), look: await r.send("look", {}), cancel: await r.send("cancel", {}) }));
+  ok(!t.second.ok && t.second.error.code === "busy" && !t.look.ok && t.look.error.code === "busy", "busy: a second install (and a look) while one runs", J([t.second, t.look]));
+  ok(!t.cancel.ok && t.cancel.error.code === "busy" && t.reply.ok && t.dev.bad === 0 && J(t.dev.writes) === J(["FM-1_015"]),
+     "cancel at the update request (step 1): busy; the install finishes", J([t.cancel, t.reply]));
+  const l = await installHeld(scn, "rx upgrade#2");
+  ok(!l.cancel.ok && l.cancel.error.code === "busy" && l.reply.ok && l.dev.bad === 0, "cancel at the loader's update request: busy; the install finishes", J([l.cancel, l.reply]));
+}
+{   // a cancel during the download aborts the fetch; a second cancel then, and one with nothing running
+  const scn = SCENARIOS[1];
+  const t = await installHeld(scn, "fetch remote-9.9.fwsc#1", async (r) => ({ cancel: await r.send("cancel", {}), again: await r.send("cancel", {}) }));
+  ok(t.cancel.ok && t.cancel.result.cancelled && t.again.ok && t.again.result.cancelled && !t.reply.ok && t.reply.error.code === "cancelled" &&
+     t.dev.sent.length === 0, "cancel during the download: cancelled, the MIDI port never touched", J([t.cancel, t.again, t.reply, t.dev.sent]));
+  const r = await configured({ dev: scn.dev() });
   const idle = await r.send("cancel", {});
   r.close();
-  ok(c.ok && c.result.cancelled && !f.ok && f.error.code === "refused" && /cancel/.test(f.error.detail) && dev.upgrades === 0,
-     "cancel before the write: the install ends, nothing sent", J([c, f]));
-  ok(idle.ok && idle.result.cancelled === false, "cancel with nothing running: ok, cancelled false");
+  ok(idle.ok && idle.result.cancelled === false, "cancel with nothing running: ok, cancelled false", J(idle));
+}
+{   // a look can't be cancelled
+  const r = await configured({ dev: new FakeFM1(pkg.image, {}) });
+  sync.trace = []; sync.target = "rx hs#1";
+  const hit = new Promise((res) => { sync.hit = res; });
+  const l = r.send("look", {});
+  const h = await hit, c = await r.send("cancel", {});
+  h.release();
+  const lr = await l;
+  r.close();
+  ok(!c.ok && c.error.code === "busy" && lr.ok, "cancel during a look: busy (only an install is cancelled); the look answers", J([c, lr]));
+}
+
+// ---- stalls: step 1's (nothing written: portBusy) and the loader's, before its first read (timeout)
+{
+  const dev = new FakeFM1(pkg.image, { stall: true }), r = await configured({ dev, idleMs: IDLE });
+  const res = await r.call("install", { target: { kind: "remote" } });
+  r.close();
+  ok(!res.ok && res.error.code === "portBusy" && dev.writes.length === 0 && dev.upgrades === 1 && !dev.sent.includes("data"),
+     "portBusy: step 1 stalls after UPGRADE (TransitFM1 0.1.1): nothing written", J(res));
+}
+{
+  const dev = new FakeFM1(pkg.image, { loaderStall: true }), r = await configured({ dev, idleMs: IDLE });
+  const res = await r.call("install", { target: { kind: "remote" } });
+  const w = r.events.filter((e) => e.stage === "write");
+  r.close();
+  ok(!res.ok && res.error.code === "timeout" && dev.upgrades === 2 && dev.loaderReads === 0 && w.length === 1 && w[0].done === 0 && w[0].total === BLOCKS,
+     "timeout: the loader stalls before its first read (not portBusy); progress write 0 came first", J([res, w]));
+}
+{
+  const dev = new FakeFM1(pkg.image, { identity: "ota-FM-1_900", name: "Felucca Update", loaderStall: true }), r = await configured({ dev, idleMs: IDLE });
+  const res = await r.call("install", { target: { kind: "remote" }, resume: true });
+  r.close();
+  ok(!res.ok && res.error.code === "timeout" && dev.loaderReads === 0, "timeout: a resume whose loader stalls before its first read", J(res));
+}
+
+// ---- the dispatch: own op names only, strings only, every check inside the error boundary; one reply per request
+{
+  const dev = new FakeFM1(pkg.image, {}), r = await configured({ dev });
+  const ids = [];
+  const raw = (msg) => { ids.push(msg.id); r.post(msg); };
+  const OPS_BAD = [["unknown", "frobnicate"], ["inherited", "toString"], ["inherited", "constructor"], ["inherited", "__proto__"],
+                   ["inherited", "hasOwnProperty"], ["inherited", "valueOf"], ["non-string", 42], ["non-string", { op: "install" }],
+                   ["non-string", ["install"]], ["non-string", null], ["non-string", true], ["non-string", 1n]];
+  OPS_BAD.forEach(([, op], k) => raw({ id: `op-${k}`, op }));
+  raw({ id: "no-op" });                                                       // missing op
+  const ARGS_BAD = [["install", {}], ["install", { target: "remote" }], ["install", { target: ["remote"] }], ["install", { target: null }],
+                    ["install", { target: { kind: 5 } }], ["install", { target: { kind: "remote" }, resume: "yes" }],
+                    ["look", { portHint: 5 }], ["look", { portHint: "" }], ["config", { v15Url: 5 }], ["config", { firmwareBase: {} }]];
+  ARGS_BAD.forEach(([op, a], k) => raw({ ...a, id: `args-${k}`, op }));
+  r.post("install"); r.post(null); r.post(7); r.post({ foo: 1 });             // not requests: no id, no op
+  const last = await r.send("config", {});                                   // (answered after every one above)
+  const byId = (id) => r.replies.filter((m) => m.id === id);
+  const opErr = OPS_BAD.map(([, op], k) => byId(`op-${k}`)).concat([byId("no-op")]);
+  ok(opErr.every((a) => a.length === 1 && !a[0].ok && a[0].error.code === "internal"),
+     "dispatch: unknown, inherited (toString, constructor...), non-string (an object, BigInt...) and missing ops: one internal reply each", J(opErr));
+  const argErr = ARGS_BAD.map((_, k) => byId(`args-${k}`));
+  ok(argErr.every((a) => a.length === 1 && !a[0].ok && a[0].error.code === "refused" && /^bad request/.test(a[0].error.detail)) && dev.sent.length === 0,
+     "dispatch: malformed arguments: one refused (bad request) reply each, the FM-1 never touched", J(argErr));
+  ok(last.ok && r.replies.length === ids.length + 2 && r.replies.every((m) => m.id !== undefined),
+     "dispatch: exactly one reply per request, none to a message that is not one", J(r.replies.length));
+  const after = await r.call("look", {});
+  ok(after.ok && after.result.firmware.kind === "stock", "dispatch: the engine still serves after them (nothing left running)", J(after));
+  // the same through handle() itself: a getter that throws, an op whose toString throws (never reached: not a string)
+  const direct = await Promise.all([r.engine.handle({ id: "d1", op: { toString() { throw new Error("x"); } } }), r.engine.handle({ get id() { throw new Error("x"); }, op: "look" })]);
+  const one = await r.send("config", {});
+  ok(direct.every((x) => x === undefined) && one.ok && byId("d1").length === 1 && byId("d1")[0].error.code === "internal",
+     "dispatch: handle() never throws (an op object with a throwing toString; an id getter that throws)", J(byId("d1")));
+  r.close();
 }
 {
   const r = await configured({ dev: new FakeFM1(pkg.image, {}) });
-  const u = await r.call("frobnicate", {}), t = await r.call("install", { target: { kind: "nope" } });
+  const t = await r.call("install", { target: { kind: "nope" } });
   r.close();
-  ok(!u.ok && u.error.code === "internal" && !t.ok && t.error.code === "refused", "an unknown op: internal; an unknown target: refused");
+  ok(!t.ok && t.error.code === "refused", "an unknown target kind: refused", J(t));
 }
 {
   const dev = new FakeFM1(pkg.image, {}), r = rig({ dev });
@@ -305,5 +484,6 @@ for (const [o, what] of [[{ held: true }, "held by another app (open fails)"], [
   ok((await look(dev.access)).none, "the page's look(): JIANT FM's port not probed (the page unchanged)");
 }
 
+ok(unhandled === 0, "no unhandled rejection in the whole run", String(unhandled));
 console.log(fails ? `engine: ${fails} of ${checks} FAILED` : `engine tests passed (${checks})`);
 process.exit(fails ? 1 : 0);

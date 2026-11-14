@@ -23,8 +23,17 @@ bundle. It loads them in the iframe and exchanges only the messages below.
 
 ## Host → engine
 
-Each request is `{ id, op, ...args }`. Each op gets exactly one final reply, `{ id, ok: true, result }` or
-`{ id, ok: false, error: EngineError }`.
+Each request is `{ id, op, ...args }`. Each request (a message with an `id` or an `op`) gets exactly one final reply,
+`{ id, ok: true, result }` or `{ id, ok: false, error: EngineError }`. That includes a request the engine can't
+serve:
+
+- an `op` that isn't one of the ops below gets `error.code = 'internal'`. This covers an unknown name, a name
+  inherited from `Object.prototype` (`toString`, `constructor`…), an `op` that isn't a string, and a missing `op`;
+- malformed arguments get `error.code = 'refused'` with `detail` starting `bad request`, and nothing is done. For
+  example: `install` without a `target` object, a `target.kind` or `config` URL that isn't a string, a
+  non-boolean `resume`, or an empty or non-string `portHint`.
+
+A message that is neither (not an object, or with no `id` and no `op`) gets no reply.
 
 - `config({ v15Url, firmwareBase })` → `{ protocol: 1, v15Url, firmwareBase }`. The URLs the host provides, so the
   engine never hard-codes an API. Send it once after connect.
@@ -45,10 +54,15 @@ Each request is `{ id, op, ...args }`. Each op gets exactly one final reply, `{ 
   The engine refuses unsafe targets with `error.code = 'refused'` (the installer's refusal rules, below). In update
   mode the engine always finishes the cut-off write, whether or not `resume` is set. With `resume: true` and no update
   mode, the install is refused.
-- `cancel()` → `{ cancelled: boolean }`. Aborts an install before the write starts: during the download, the check
-  or the look. The cancelled install's own reply is `error.code = 'refused'` with `detail` starting
-  `cancelled`. Once the write has started (the update request has been sent), it can't be aborted, and `cancel`
-  gets an `error.code = 'busy'` reply. With nothing running, the reply is `{ cancelled: false }`.
+- `cancel()` → `{ cancelled: boolean }`. Aborts an install before the write: during the download, the check, the
+  look, or anything else the install waits on before it commits to the write. A `{ cancelled: true }` reply is a
+  promise: that install never sends a write SysEx, and its own reply is `error.code = 'cancelled'` (`detail` starts
+  `cancelled`). The engine checks for a cancel after each of those waits, and makes its last check and its commit
+  with nothing in between. From the commit on (the update's own handshake, just before the update request), the
+  install can't be aborted. `cancel` then gets an `error.code = 'busy'` reply, never `cancelled`, and the install
+  goes on to its own reply. A `cancel` during `config` or `look` is also `busy`. With nothing running, the reply is
+  `{ cancelled: false }`. The V15 detour is two installs (the V15, then RemoteFM1), and each has its own checks and
+  commit.
 
 Exactly one op (`config`, `look` or `install`) runs at a time. Any of them sent while another runs gets
 `error.code = 'busy'`. Only `cancel` is answered while an op runs.
@@ -59,7 +73,8 @@ Exactly one op (`config`, `look` or `install`) runs at a time. Any of them sent 
   - `download` (bytes; `total` is the Content-Length, or 0 while unknown);
   - `verify` (0/1, then 1/1: the SHA-256 and the package checks);
   - `enter-update` (0/2 when the update request is sent, 1/2 when the FM-1 restarts into update mode);
-  - `write` (blocks the loader has read, of `ceil(image / 512)`);
+  - `write` (blocks the loader has read, of `ceil(image / 512)`: 0 once the loader is found, before its update
+    request, then 1, 2…);
   - `reboot` (0/1 when it restarts into the new firmware, 1/1 when it is back);
   - `confirm` (0/1, then 1/1 once `look` shows the firmware that was installed).
 
@@ -83,7 +98,7 @@ interface Fm1State {
   resumable: boolean;                                      // an install cut off that `install({ resume: true })` finishes
   previous?: { name: string; version?: string; sha256?: string };   // what the unit ran (INFO), for the restore record
 }
-type EngineError = { code: 'firmwareUnavailable' | 'portBusy' | 'sysexDenied' | 'disconnected' | 'refused' | 'verifyFailed' | 'timeout' | 'busy' | 'internal'; detail: string; httpStatus?: number };
+type EngineError = { code: 'firmwareUnavailable' | 'portBusy' | 'sysexDenied' | 'disconnected' | 'refused' | 'cancelled' | 'verifyFailed' | 'timeout' | 'busy' | 'internal'; detail: string; httpStatus?: number };
 ```
 
 Errors are machine-readable. `detail` is for logs and "Copy details" only, and the host writes all user-facing text.
@@ -128,14 +143,15 @@ Errors are machine-readable. `detail` is for logs and "Copy details" only, and t
 | Code | When |
 | --- | --- |
 | `firmwareUnavailable` | The download failed: a network error (no `httpStatus`), or a response that is not 200 (`httpStatus`). Nothing was written. |
-| `portBusy` | An FM-1-named port can't be opened (another app holds it), or doesn't answer the handshake (flooded or held), or step 1 stalled after the update request (TransitFM1 0.1.1: a DAW's MIDI flooding the port). Nothing was written. This replaces "close every MIDI app". |
+| `portBusy` | An FM-1-named port can't be opened (another app holds it), or doesn't answer the handshake (flooded or held), or step 1 stalled after the update request (TransitFM1 0.1.1: a DAW's MIDI flooding the port). Nothing was written. This replaces "close every MIDI app". A stall once the loader is found is `timeout`. |
 | `sysexDenied` | `requestMIDIAccess({ sysex: true })` was rejected (`SecurityError` / `NotAllowedError`), or the browser has no Web MIDI. |
 | `disconnected` | No FM-1 to install on, or the port disappeared mid-install (unplugged). Run `look`: in update mode `resumable` tells whether `install({ resume: true })` finishes it. |
-| `refused` | The refusal rules above, an unknown target, a resume outside update mode, or a cancelled install (`detail` starts with `cancelled`). |
+| `refused` | The refusal rules above, an unknown target, a resume outside update mode, or a malformed request (`detail` starts with `bad request`). |
+| `cancelled` | The install's own reply after a `cancel` was acknowledged (`{ cancelled: true }`). It always comes before the write, so nothing was written. (Earlier drafts of protocol v1 used `refused` with `detail` "cancelled…".) |
 | `verifyFailed` | The SHA-256 or the package check failed, or after the install the FM-1 reports another firmware than the one written. |
-| `timeout` | The loader didn't appear, stalled mid-write, or the FM-1 didn't come back after the write. |
-| `busy` | Another op runs, or a `cancel` came after the write started. |
-| `internal` | No `config` yet (`v15Url` / `firmwareBase` missing), an unknown op, or anything unexpected. |
+| `timeout` | The loader didn't appear, stalled (before its first read or mid-write), or the FM-1 didn't come back after the write. |
+| `busy` | Another op runs, or a `cancel` came after the install committed to the write (or during `config` / `look`). |
+| `internal` | No `config` yet (`v15Url` / `firmwareBase` missing), an unknown, inherited, non-string or missing op, or anything unexpected. |
 
 ## Vendoring
 
@@ -170,7 +186,15 @@ The published site also serves the engine: `engine.html` and `engine.js` at its 
 - the V15 detour;
 - resume;
 - every error code;
-- the order of the progress events.
+- the order of the progress events;
+- cancel at every point an install waits on the outside world before its write. Those points are each fetch, the MIDI
+  access, each port's open, each message the FM-1 takes and the SHA-256. The scenarios are both installs of the V15
+  detour, a restore and a resume. Each run holds the engine at one point with its timers frozen, so it moves only on
+  the cancel message, never on the clock. Before the commit, the cancel must be acknowledged and no write SysEx may
+  follow. After it, the cancel must be `busy` and the install must finish;
+- the stalls: step 1's (`portBusy`) and the loader's before its first read (`timeout`);
+- the dispatch: unknown, inherited, non-string and missing ops, malformed arguments, one reply per request, and no
+  unhandled rejection.
 
 `node web/installer/test_installer.mjs` still tests the page's decisions. CI runs both
 (`.github/workflows/installer-tests.yml` on pull requests, and the Pages build).
