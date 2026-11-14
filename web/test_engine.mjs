@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-only
-// The headless engine (engine.js, protocol v1, docs/ENGINE.md) driven through a real MessagePort (Node's
+// The headless engine (engine.js, protocol v1.1, docs/ENGINE.md) driven through a real MessagePort (Node's
 // MessageChannel) against the simulated FM-1 of installer/fake_fm1.mjs and a fake fetch: the handshake, look for each
 // firmware and mode, a direct install, the V15 detour (refused direct, V15, then RemoteFM1), resume from update mode,
 // the errors (firmwareUnavailable on a 404 and a network error, portBusy, sysexDenied, disconnected mid-write, busy,
 // refused, cancelled, timeout on a loader's stall) and the progress order; a cancel at every sync point before and
 // after the commit to the write (no write SysEx after an acknowledged cancel; cancelled even when the awaited operation
 // then fails: a download error, sysex denied, a port that won't open, a silent FM-1); the dispatch (unknown, inherited,
-// non-string and missing ops, malformed arguments: one reply each). Plus installer.js's pure decisions. Never against
+// non-string and missing ops, malformed arguments: one reply each); v1.1 (expect: unitChanged, ambiguousUnit, on a bench of
+// fake units swapped or added while an install is held). Plus installer.js's pure decisions. Never against
 // a real unit.
 //   node web/test_engine.mjs
 import { readFileSync } from "node:fs";
@@ -91,8 +92,10 @@ const ROUTES = { [`${BASE}remote-9.9.fwsc`]: raw, [V15]: raw, [RELEASES_URL]: { 
 // reply, in order. The MIDI access is a sync point ("midi"), and so are the fake FM-1's ports and messages
 function rig({ dev = null, routes = ROUTES, midi, releases = RELEASES, idleMs } = {}) {
   const { port1, port2 } = new MessageChannel();
-  // (a rejected rx point: the fake FM-1 never takes that message nor any after it, it goes silent)
-  if (dev && dev.gate === null) dev.gate = (kind) => kind === "open" ? point("open") : point(`rx ${kind}`).catch(() => new Promise(() => {}));
+  // (a rejected rx point: the fake FM-1 never takes that message nor any after it, it goes silent). A bench (below):
+  // each of its units, plugged in or not yet
+  for (const u of dev && dev.units ? dev.units : [dev])
+    if (u && u.gate === null) u.gate = (kind) => kind === "open" ? point("open") : point(`rx ${kind}`).catch(() => new Promise(() => {}));
   const engine = createEngine({ requestMIDIAccess: midi || (async () => { await point("midi"); return dev.access; }), fetch: fakeFetch(routes), releases,
                                 v15Sha256: V15_SHA, idleMs });
   engine.attach(port2);
@@ -110,6 +113,14 @@ function rig({ dev = null, routes = ROUTES, midi, releases = RELEASES, idleMs } 
   return { send, post, events, replies, engine, close: () => { port1.close(); port2.close(); },
            async call(op, args) { events.length = 0; return send(op, args); } };
 }
+// a bench: several fake FM-1s on one MIDI access (protocol v1.1's tests). units: every unit of the test (all gated);
+// plugged: those connected at first. pull(u): unplugged; plug(u): connected (the access lists it from then on)
+function bench(units, plugged = units) {
+  const on = new Set(plugged);
+  const merged = (k) => new Map([...on].flatMap((u) => [...u.access[k]]));
+  return { units, access: { get inputs() { return merged("inputs"); }, get outputs() { return merged("outputs"); }, onstatechange: null },
+           pull(u) { u.unplug(); on.delete(u); }, plug(u) { on.add(u); } };
+}
 const configured = async (o) => { const r = rig(o); await r.call("config", { v15Url: V15, firmwareBase: BASE.slice(0, -1) }); return r; };
 const stages = (evs) => evs.filter((e) => e.event === "progress").map((e) => e.stage).filter((s, i, a) => s !== a[i - 1]);
 
@@ -120,7 +131,7 @@ const stages = (evs) => evs.filter((e) => e.event === "progress").map((e) => e.s
   const win = { location: { origin: "https://tutti.example" }, parent, addEventListener: (t, f) => listeners.push(f) };
   boot(win, {}, { releases: RELEASES, fetch: fakeFetch(ROUTES) });
   ok(posted.length === 1 && posted[0][0].type === "rfm1-engine-ready" && posted[0][0].protocol === PROTOCOL && PROTOCOL === 1 &&
-     posted[0][1] === "https://tutti.example", "boot: posts rfm1-engine-ready, protocol 1, to the parent's origin");
+     posted[0][0].minor === 1 && posted[0][1] === "https://tutti.example", "boot: posts rfm1-engine-ready, protocol 1 (minor 1: v1.1), to the parent's origin");
   const tryConnect = async (source, origin) => {
     const { port1, port2 } = new MessageChannel();
     listeners.forEach((f) => f({ source, origin, data: { type: "rfm1-engine-connect" }, ports: [port2] }));
@@ -386,6 +397,13 @@ function failureAt(key) {
   if (key.startsWith("digest")) return new Error("digest failed");
   return new Error("silent");
 }
+// protocol v1.1: the host's expect, from its look -> { port, mode, identity, firmware: { kind, name?, version? } }
+const expectOf = (st) => ({ port: st.port, mode: st.mode, ...(st.identity ? { identity: st.identity } : {}),
+  ...(st.firmware ? { firmware: { kind: st.firmware.kind, ...(st.firmware.name ? { name: st.firmware.name } : {}), ...(st.firmware.version ? { version: st.firmware.version } : {}) } } : {}) });
+const EXPECT_STOCK = { port: { input: "FM-1", output: "FM-1" }, mode: "normal", identity: "FM-1_015", firmware: { kind: "stock" } };
+const EXPECT_LOADER = { port: { input: "Felucca Update", output: "Felucca Update" }, mode: "update", identity: "ota-FM-1_900" };
+ok(J(expectOf((await lookAs({})).result)) === J(EXPECT_STOCK) && J(expectOf((await lookAs({ identity: "ota-FM-1_900", name: "Felucca Update" })).result)) === J(EXPECT_LOADER),
+   "v1.1: look reports the identity; the scenarios' expects are look's own");
 const SCENARIOS = [
   // the V15 detour's two installs, each its own op: the V15 over SLOOP (its context() fetches releases.json last,
   // after the look: the review's case), then RemoteFM1 over the V15 the unit then runs
@@ -396,6 +414,12 @@ const SCENARIOS = [
   { what: "a package (restore) over stock", args: { target: { kind: "package", url: `${BASE}remote-9.9.fwsc`, sha256: sha, label: "x" } }, upgrades: 2,
     dev: () => new FakeFM1(pkg.image, { finalRemote: "9.9" }) },
   { what: "resume from update mode", args: { target: { kind: "remote" }, resume: true }, upgrades: 1,
+    dev: () => new FakeFM1(pkg.image, { identity: "ota-FM-1_900", name: "Felucca Update", finalRemote: "9.9" }) },
+  // protocol v1.1: the same cancel semantics with expect (its unit count at the start and its re-read: more points
+  // before the commit, the same commit). The expects are what look reports for these units (checked below)
+  { what: "v1.1 (expect): RemoteFM1 over the V15", args: { target: { kind: "remote" }, expect: EXPECT_STOCK }, upgrades: 2,
+    dev: () => new FakeFM1(pkg.image, { finalRemote: "9.9" }) },
+  { what: "v1.1 (expect, mode update): resume", args: { target: { kind: "remote" }, resume: true, expect: EXPECT_LOADER }, upgrades: 1,
     dev: () => new FakeFM1(pkg.image, { identity: "ota-FM-1_900", name: "Felucca Update", finalRemote: "9.9" }) },
 ];
 for (const scn of SCENARIOS) {
@@ -479,6 +503,130 @@ for (const scn of SCENARIOS) {
   ok(!c.ok && c.error.code === "busy" && lr.ok, "cancel during a look: busy (only an install is cancelled); the look answers", J([c, lr]));
 }
 
+// ---- protocol v1.1: install binds to the verified unit (expect): unitChanged, ambiguousUnit
+// A bench of fake FM-1s, the host's look on the unit first (its expect, expectOf), then the install held at a sync
+// point (the paused-run harness: no clock), where act(bench) swaps or adds a unit; release. -> { reply, hit, trace, events }
+const DL = "fetch remote-9.9.fwsc#1";                  // (the download of the bundled RemoteFM1)
+async function bound({ units, plugged = [units[0]], args = { target: { kind: "remote" } }, at = null, act = () => {}, expect = true, tweak = (x) => x }) {
+  const bn = bench(units, plugged), r = await configured({ dev: bn });
+  const l = await r.call("look", {});
+  const exp = expect ? tweak(expectOf(l.result)) : undefined;
+  sync.trace = []; sync.target = at;
+  const hit = at ? new Promise((res) => { sync.hit = res; }) : null;
+  const inst = r.call("install", { ...args, ...(exp ? { expect: exp } : {}) });
+  const h = at ? await Promise.race([hit, inst.then(() => null)]) : null;
+  if (h) { act(bn); h.release(); }
+  const reply = await inst;
+  sync.target = null;
+  const trace = sync.trace.slice(), events = r.events.slice();
+  r.close();
+  return { look: l, expect: exp, reply, hit: !!h, trace, events };
+}
+const swap = (a, b) => (bn) => { bn.pull(a); bn.plug(b); };
+const untouched = (...us) => us.every((u) => u.upgrades === 0 && u.served === 0 && u.writes.length === 0 && !u.sent.some((k) => WRITE_KINDS.includes(k)));
+const code = (t) => (t.reply.ok ? "ok" : t.reply.error.code);
+// A: the unit the host verified (stock, "FM-1"); B: another unit holding user data (Felucca 1.0.1, its own port name)
+const unitA = (o = {}) => new FakeFM1(pkg.image, { finalRemote: "9.9", ...o });
+const unitB = (o = {}) => new FakeFM1(pkg.image, { identity: "FM-1_910", name: "Felucca", version: "FELUCCA v1.0.1", finalRemote: "9.9", ...o });
+{   // the happy path: expect from look, the same unit: installed
+  const a = unitA(), t = await bound({ units: [a] });
+  ok(t.look.result.identity === "FM-1_015" && t.reply.ok && t.reply.result.installed.firmware.kind === "remote" && a.writes.length === 1 && a.bad === 0,
+     "v1.1: expect from look, the same unit: installed", J(t.reply));
+}
+{   // the review's case: unit A swapped for unit B during the download
+  const a = unitA(), b = unitB(), t = await bound({ units: [a, b], at: DL, act: swap(a, b) });
+  ok(t.hit && code(t) === "unitChanged" && untouched(a, b) && !t.events.some((e) => e.stage === "enter-update"),
+     "v1.1: A swapped for B (Felucca, user data) during the download: unitChanged, no write SysEx to either", J([t.reply, b.sent]));
+  // v1 (no expect), the same swap: B is flashed. The gap v1.1 closes; v1's behavior is unchanged
+  const a1 = unitA(), b1 = unitB(), v1 = await bound({ units: [a1, b1], at: DL, act: swap(a1, b1), expect: false });
+  ok(v1.hit && b1.writes.length === 1 && b1.upgrades === 2, "v1 (expect absent), the same swap: B is written (v1 unchanged; the gap v1.1 closes)", J([v1.reply, b1.writes]));
+}
+{   // a second FM-1 at the start: ambiguousUnit before the download
+  const a = unitA(), b = unitB(), bn = bench([a, b], [a]), r = await configured({ dev: bn });
+  const l = await r.call("look", {});
+  bn.plug(b);
+  sync.trace = [];
+  const res = await r.call("install", { target: { kind: "remote" }, expect: expectOf(l.result) });
+  const trace = sync.trace.slice();
+  // v1 (no expect): several FM-1s stay refused, as before
+  const v1 = await r.call("install", { target: { kind: "remote" } });
+  r.close();
+  ok(!res.ok && res.error.code === "ambiguousUnit" && untouched(a, b) && !trace.includes(DL),
+     "v1.1: a second FM-1 plugged in at the start: ambiguousUnit, before the download, nothing sent to either", J([res, trace]));
+  ok(!v1.ok && v1.error.code === "refused" && /several/.test(v1.error.detail) && untouched(a, b), "v1 (expect absent): two FM-1s: refused, as before", J(v1));
+}
+{   // a second FM-1 at the updater's selection: plugged in after the engine's re-read (at its last message, INFO), and
+    // during the updater's own scan (its handshake with A: the candidates are listed again)
+  const a = unitA(), b = unitB(), t = await bound({ units: [a, b], at: "rx info#1", act: (bn) => bn.plug(b) });
+  ok(t.hit && code(t) === "ambiguousUnit" && untouched(a, b), "v1.1: a second FM-1 plugged in after the re-read, at the updater's selection: ambiguousUnit, nothing written", J([t.reply, t.trace]));
+  const ref = await bound({ units: [unitA()] });
+  const sel = ref.trace.slice(0, ref.trace.indexOf("rx upgrade#1")).filter((k) => k.startsWith("rx hs#")).pop();   // (the updater's handshake)
+  const a2 = unitA(), b2 = unitB(), t2 = await bound({ units: [a2, b2], at: sel, act: (bn) => bn.plug(b2) });
+  ok(t2.hit && ref.trace.indexOf(sel) === ref.trace.indexOf("rx upgrade#1") - 1 && code(t2) === "ambiguousUnit" && untouched(a2, b2),
+     `v1.1: a second FM-1 plugged in during the updater's own scan (${sel}): ambiguousUnit, nothing written`, J([t2.reply, ref.trace]));
+}
+{   // update mode: our loader re-enumerated under another port name is accepted; another loader under another name is
+    // refused; the official loader under its own name (the V15's resume) is accepted
+  const l1 = new FakeFM1(pkg.image, { identity: "ota-FM-1_900", name: "Felucca Update", finalRemote: "9.9" });
+  const l2 = new FakeFM1(pkg.image, { identity: "ota-FM-1_900", name: "FM-1 Update", finalRemote: "9.9" });
+  const t = await bound({ units: [l1, l2], args: { target: { kind: "remote" }, resume: true }, at: DL, act: swap(l1, l2) });
+  ok(t.hit && t.expect.mode === "update" && t.reply.ok && l2.writes.length === 1 && l2.bad === 0 && untouched(l1),
+     "v1.1: resume, our loader re-enumerated as \"FM-1 Update\" (not look's \"Felucca Update\"): accepted, written", J(t.reply));
+  const o1 = new FakeFM1(pkg.image, { identity: "ota-FM-1_015", name: "ota-FM-1", final: "FM-1_015", finalRemote: null });
+  const o2 = new FakeFM1(pkg.image, { identity: "ota-FM-1_015", name: "FM-1 Update", final: "FM-1_015", finalRemote: null });
+  const f = await bound({ units: [o1, o2], args: { target: { kind: "v15" }, resume: true }, at: "fetch FM-1.fwsc#1", act: swap(o1, o2) });
+  ok(f.hit && code(f) === "refused" && untouched(o1, o2), "v1.1: a loader not ours (the official ota-FM-1_015) under another port name: refused, nothing written", J(f.reply));
+  const s1 = new FakeFM1(pkg.image, { identity: "ota-FM-1_015", name: "ota-FM-1", final: "FM-1_015", finalRemote: null });
+  const s = await bound({ units: [s1], args: { target: { kind: "v15" }, resume: true } });
+  ok(s.reply.ok && s1.writes.length === 1, "v1.1: the official loader under the port look reported: the V15's resume accepted", J(s.reply));
+  const m1 = new FakeFM1(pkg.image, { identity: "ota-FM-1_900", name: "Felucca Update" }), m2 = unitA({ name: "Felucca Update" });
+  const m = await bound({ units: [m1, m2], args: { target: { kind: "remote" }, resume: true }, at: DL, act: swap(m1, m2) });
+  ok(m.hit && code(m) === "unitChanged" && untouched(m1, m2), "v1.1: expect.mode update, the unit now in normal mode (same port name): unitChanged", J(m.reply));
+}
+{   // firmware, identity, mode mismatches (the same port name "FM-1"), each swapped in during the download: unitChanged
+  const cases = [
+    ["firmware (stock -> RemoteFM1 0.1)", unitA(), unitA({ remote: "0.1" })],
+    ["firmware version (RemoteFM1 0.1 -> 0.2)", unitA({ remote: "0.1" }), unitA({ remote: "0.2" })],
+    ["identity (FM-1_015 -> FM-1_920 ChoralRoot)", unitA(), unitA({ identity: "FM-1_920", version: "ChoralRoot 0.25.1" })],
+    ["mode (normal -> update)", unitA(), unitA({ identity: "ota-FM-1_900" })],
+  ];
+  for (const [what, a, b] of cases) {
+    const t = await bound({ units: [a, b], at: DL, act: swap(a, b) });
+    ok(t.hit && code(t) === "unitChanged" && untouched(a, b), `v1.1: ${what}: unitChanged, nothing written`, J(t.reply));
+  }
+  // and without a swap: an expect that does not match the unit (identity, firmware name, port output)
+  for (const [what, tweak] of [["identity", (x) => ({ ...x, identity: "FM-1_014" })], ["firmware", (x) => ({ ...x, firmware: { kind: "custom", name: "SLOOP" } })],
+                               ["port output", (x) => ({ ...x, port: { input: "FM-1", output: "FM-1 #2" } })]]) {
+    const a = unitA(), t = await bound({ units: [a], tweak });
+    ok(code(t) === "unitChanged" && untouched(a), `v1.1: an expect whose ${what} is not the unit's: unitChanged, nothing written`, J(t.reply));
+  }
+  // the identity as INFO reports it (a Felucca-family unit) also binds
+  const b = unitB(), t = await bound({ units: [b], tweak: (x) => ({ ...x, identity: "FELUCCA v1.0.1" }) });
+  ok(t.reply.ok && b.writes.length === 1, "v1.1: expect.identity as INFO reports it (FELUCCA v1.0.1): the same unit, installed", J(t.reply));
+}
+{   // the check sits immediately before the commit: in engine.js, the final same-unit check is between the last cancel
+    // check and op.writing = true, and with expect nothing is awaited from the re-read to the commit (context() was read
+    // before it: `ctx || await context()` never awaits then)
+  const src = readFileSync(new URL("./engine.js", import.meta.url), "utf8");
+  const from = src.indexOf("const st = await probe(acc, null, !!expect);"), to = src.indexOf("op.writing = true;", from);
+  const between = src.slice(from + "const st = await probe(acc, null, !!expect);".length, to);
+  ok(from > 0 && to > from && /check\(\);\s*if \(expect\) sameUnit\(st, expect\);\s*$/.test(between) &&
+     !/\bawait\b/.test(between.replace(/\/\/[^\n]*/g, "").replace("ctx || await context()", "")) && /const ctx = expect \? await context\(\) : null;\s*check\(\);\s*\/\/[^\n]*\n\s*const st = await probe/.test(src),
+     "v1.1: the final same-unit check is right before op.writing = true; no await from the re-read to the commit", between);
+  // and run: A swapped for B at every sync point before the updater's update request (the engine's points before its
+  // commit, then the updater's selection after it): never a write SysEx to B, and never an install reported done
+  const ref = await bound({ units: [unitA()] });
+  const head = ref.trace.slice(0, ref.trace.indexOf("rx upgrade#1"));
+  const seen = new Map(), badSwap = [];
+  for (const key of head) {
+    const a = unitA(), b = unitB(), t = await bound({ units: [a, b], at: key, act: swap(a, b) });
+    seen.set(code(t), (seen.get(code(t)) || 0) + 1);
+    if (!t.hit || t.reply.ok || !["unitChanged", "ambiguousUnit", "disconnected", "portBusy"].includes(code(t)) || !untouched(a, b)) badSwap.push([key, t.reply]);
+  }
+  ok(ref.reply.ok && head.length > 5 && badSwap.length === 0 && seen.get("unitChanged") > 0,
+     `v1.1: A swapped for B at each of the ${head.length} points before the update request: nothing written (${J([...seen])})`, J(badSwap));
+}
+
 // ---- stalls: step 1's (nothing written: portBusy) and the loader's, before its first read (timeout)
 {
   const dev = new FakeFM1(pkg.image, { stall: true }), r = await configured({ dev, idleMs: IDLE });
@@ -514,7 +662,12 @@ for (const scn of SCENARIOS) {
   raw({ id: "no-op" });                                                       // missing op
   const ARGS_BAD = [["install", {}], ["install", { target: "remote" }], ["install", { target: ["remote"] }], ["install", { target: null }],
                     ["install", { target: { kind: 5 } }], ["install", { target: { kind: "remote" }, resume: "yes" }],
-                    ["look", { portHint: 5 }], ["look", { portHint: "" }], ["config", { v15Url: 5 }], ["config", { firmwareBase: {} }]];
+                    ["look", { portHint: 5 }], ["look", { portHint: "" }], ["config", { v15Url: 5 }], ["config", { firmwareBase: {} }],
+                    // v1.1's expect: an object with port { input, output }, mode normal | update, identity and firmware typed
+                    ["install", { target: { kind: "remote" }, expect: 5 }], ["install", { target: { kind: "remote" }, expect: { port: "FM-1", mode: "normal" } }],
+                    ["install", { target: { kind: "remote" }, expect: { port: { input: "FM-1", output: "FM-1" }, mode: "uboot" } }],
+                    ["install", { target: { kind: "remote" }, expect: { port: { input: "FM-1", output: "FM-1" }, mode: "normal", identity: 15 } }],
+                    ["install", { target: { kind: "remote" }, expect: { port: { input: "FM-1", output: "FM-1" }, mode: "normal", firmware: { name: "x" } } }]];
   ARGS_BAD.forEach(([op, a], k) => raw({ ...a, id: `args-${k}`, op }));
   r.post("install"); r.post(null); r.post(7); r.post({ foo: 1 });             // not requests: no id, no op
   const last = await r.send("config", {});                                   // (answered after every one above)

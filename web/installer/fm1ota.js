@@ -29,7 +29,8 @@ export const PORT_RE = /fm-1|smk|elite|mke-p37|starry|felucca|sloop|clipper|melo
 
 // errors carry a code the pages translate: notfound, model, stopped, noloader, lost, noreturn,
 // mismatch (detail: the identity the device reports), badreq, other (an SMK firmware with its own updater),
-// foreign (detail: the loader's identity)
+// foreign (detail: the loader's identity); under a binding (Updater opts.bind, engine protocol v1.1): ambiguous (more
+// than one unit answers), changed (the unit is not the one bound to)
 function fail(code, msg, detail = "") { const e = new Error(msg); e.code = code; e.detail = detail; return e; }
 
 export function pack7(data) {
@@ -131,6 +132,22 @@ export function refusalText(name) {
 }
 export const REFUSE_REASON = "An install over it has left an FM-1 that no longer starts, and the data it leaves in the flash is not known to be safe for ChoralRoot.";
 
+// The binding of engine protocol v1.1 (docs/ENGINE.md): is the unit found the one the host verified? bind: { mode:
+// "normal" | "update", port: the input port's name, identity?: the handshake identity }; dev: { id, name } (find()'s)
+// -> null (the same unit) | "changed" | "foreign". A unit in update mode may re-enumerate under another port name (the
+// loader's own, "Felucca Update"): then our own loader (OUR_LOADER) takes the place of the port name's check, and any
+// other loader under another name is foreign. The identity, when bound, must still be the same
+export function boundMismatch(bind, dev) {
+  const update = IS_OTA(dev.id);
+  if (update !== (bind.mode === "update")) return "changed";
+  if (dev.name !== bind.port) {
+    if (!update) return "changed";
+    if (!OUR_LOADER(dev.id)) return "foreign";
+  }
+  if (bind.identity && dev.id.text !== bind.identity) return "changed";
+  return null;
+}
+
 // one MIDI in/out pair with a SysEx queue
 class Link {
   constructor(input, output) {
@@ -186,13 +203,16 @@ const FM1_PORT = PORT_RE;                                       // never probe o
 export class Updater {
   // portRe: the port names probed (default PORT_RE; the engine adds firmwares' own port names, e.g. "JIANT FM").
   // opts.idleMs: { step1, write }, how long step 1 and the loader may stay silent (default 8 s and 180 s; the tests
-  // shorten them)
+  // shorten them). opts.bind (engine protocol v1.1): { mode, port, identity? } (boundMismatch): the device install()
+  // and resume() select, and the loader install() waits for after step 1, must be the only unit that answers
+  // (ambiguous otherwise), and the device selected must be the bound one (changed / foreign otherwise)
   constructor(access, log, portRe = FM1_PORT, opts = {}) {
     this.access = access;
     this.log = log || (() => {});
     this.portRe = portRe || FM1_PORT;
     const idle = opts.idleMs || {};
     this.idle = { step1: idle.step1 || 8000, write: idle.write || 180000 };
+    this.bind = opts.bind || null;
   }
 
   // the input ports that may be an FM-1 (connected, a name that matches)
@@ -224,10 +244,58 @@ export class Updater {
     return got;
   }
 
-  async waitFor(filter, ms) {
+  // every unit that answers, its link left open -> [{ link, id, name }]. The candidates are listed again after each
+  // pass: a port that appeared while the others were asked is asked too (a second FM-1 plugged in during the scan)
+  async answering() {
+    const got = [], asked = new Set();
+    for (let fresh; (fresh = this.candidates().filter((p) => !asked.has(p))).length;) {
+      for (const input of fresh) {
+        asked.add(input);
+        const output = pairOutput(this.access, input);
+        if (!output) continue;
+        try { await input.open(); await output.open(); } catch (_) { continue; }
+        const link = new Link(input, output);
+        const id = await handshake(link, 2);
+        if (id) got.push({ link, id, name: input.name }); else link.close();
+      }
+    }
+    return got;
+  }
+
+  // under the binding: exactly one unit answers (none -> null; several -> ambiguous, nothing sent to any) and it
+  // passes filter (else null) -> { link, id, name } | null, its link open
+  async only(filter) {
+    const got = await this.answering();
+    if (got.length > 1) {
+      got.forEach((d) => d.link.close());
+      throw fail("ambiguous", `${got.length} FM-1s answer (${got.map((d) => `${d.id.text} (${d.name})`).join(", ")}): nothing was written`);
+    }
+    const dev = got[0] || null;
+    if (dev && filter && !filter(dev.id)) { dev.link.close(); return null; }
+    return dev;
+  }
+
+  // the device install() / resume() writes: find(filter); under the binding the only unit, and the bound one
+  async select(filter) {
+    if (!this.bind) return this.find(filter);
+    const dev = await this.only(null);
+    if (!dev) return null;
+    const why = boundMismatch(this.bind, dev);
+    if (why) {
+      dev.link.close();
+      throw fail(why, why === "foreign"
+        ? `the device is in the update mode of another firmware under another port (${dev.id.text}, ${dev.name}): nothing was written`
+        : `the device is not the one verified (${dev.id.text} on ${dev.name}, not ${this.bind.identity || this.bind.mode} on ${this.bind.port}): nothing was written`, dev.id.text);
+    }
+    if (filter && !filter(dev.id)) { dev.link.close(); return null; }
+    return dev;
+  }
+
+  // single: under the binding, the only unit that answers (only())
+  async waitFor(filter, ms, single = false) {
     const end = Date.now() + ms;
     while (Date.now() < end) {
-      const dev = await this.find(filter);
+      const dev = single ? await this.only(filter) : await this.find(filter);
       if (dev) return dev;
       await sleep(1000);
     }
@@ -267,7 +335,7 @@ export class Updater {
   // same keyboard (an SMK-37 Elite package on a unit that reports SMK-37 Pro); never an FM-1 one on an SMK, nor back
   async install(image, product, onStep, anyModel = false) {
     const step = onStep || (() => {});
-    const dev = await this.find((id) => !IS_OTA(id));
+    const dev = await this.select((id) => !IS_OTA(id));
     if (!dev) throw fail("notfound", "FM-1 not found (USB cable, and no other app using it?)");
     if (OTHER_SMK(dev.id)) { dev.link.close(); throw fail("other", `the keyboard runs a firmware with its own updater (${dev.id.text}): nothing was sent`, dev.id.text); }
     const [model] = product.split("_");
@@ -282,7 +350,8 @@ export class Updater {
     if (!s1.finished && !jumped) throw fail(s1.lost ? "lost" : "stopped", `the device ${s1.lost ? "was disconnected" : "stopped"} after ${s1.served} requests: nothing was written`);
     step("loader");
     await sleep(3000);
-    const ota = await this.waitFor(jumped ? IS_OTA : (id) => id.model === "ota-" + model, jumped ? 15000 : 30000);
+    // (under the binding the loader must be the only unit that answers; its port name is its own)
+    const ota = await this.waitFor(jumped ? IS_OTA : (id) => id.model === "ota-" + model, jumped ? 15000 : 30000, !!this.bind);
     if (jumped && !(ota && OUR_LOADER(ota.id) && sameKeyboard(ota.id.model.replace(/^ota-/i, ""), dev.id.model) &&
                     (ota.id.model === "ota-" + model || (anyModel && sameKeyboard(ota.id.model.replace(/^ota-/i, ""), model))))) {
       if (ota) ota.link.close();
@@ -321,7 +390,7 @@ export class Updater {
   async resume(image, onStep, opts = {}) {
     const want = opts.product || opts.package || "";
     const model = want.split("_")[0];
-    const ota = await this.find(IS_OTA);
+    const ota = await this.select(IS_OTA);
     if (!ota) return false;
     if (!OUR_LOADER(ota.id) && !opts.product) {   // (the return to stock: the official loader's own image)
       ota.link.close();

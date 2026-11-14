@@ -166,12 +166,14 @@ const versionIn = (info) => ((/(\d+(?:\.\d+)+\S*)/.exec(info || "") || [])[1]) |
 
 // look()'s result as the engine protocol's Fm1State (docs/ENGINE.md). ctx: { newest: the newest bundled RemoteFM1
 // version, previous: what the unit ran before an install this session cut off (for update mode), releases: [{ version,
-// sha256 }] (a RemoteFM1 previous gets its package's SHA-256) }
+// sha256 }] (a RemoteFM1 previous gets its package's SHA-256) }. identity (protocol v1.1, additive): the update
+// protocol's handshake identity ("FM-1_015", "ota-FM-1_900"), what a host passes back as install's expect.identity
 export function stateOf(st, ctx = {}) {
   if (st.none || st.several) return { port: null, mode: "normal", firmware: null, resumable: false };
   const port = st.ports ? { input: st.ports.input, output: st.ports.output } : { input: st.port, output: st.port };
+  const identity = st.identity ? { identity: st.identity } : {};
   if (st.loader) {
-    const out = { port, mode: "update", firmware: null, resumable: !!resumableWith(st) };
+    const out = { port, mode: "update", firmware: null, resumable: !!resumableWith(st), ...identity };
     if (ctx.previous) out.previous = ctx.previous;
     return out;
   }
@@ -197,7 +199,7 @@ export function stateOf(st, ctx = {}) {
     firmware = { kind: "unknown", ...(st.identity ? { identity: st.identity } : {}) };
     previous = { name: st.identity || "unknown" };
   }
-  return { port, mode: "normal", firmware, resumable: false, previous };
+  return { port, mode: "normal", firmware, resumable: false, ...identity, previous };
 }
 
 // a sentence for "What is on my FM-1?"

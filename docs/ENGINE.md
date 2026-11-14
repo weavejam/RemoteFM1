@@ -1,4 +1,4 @@
-# The headless installer engine (protocol v1)
+# The headless installer engine (protocol v1.1)
 
 `web/engine.html` + `web/engine.js` are the RemoteFM1 installer without a page. A host such as TuttiDAW's FM-1 setup
 wizard runs the engine in a **hidden same-origin iframe** with `allow="midi"` and talks to it only through a
@@ -14,7 +14,9 @@ bundle. It loads them in the iframe and exchanges only the messages below.
 ## Handshake
 
 1. The host creates the iframe (`<iframe src=".../engine.html" allow="midi" hidden>`) and waits for
-   `{ type: 'rfm1-engine-ready', protocol: 1 }` from `iframe.contentWindow`. The engine posts it to `window.parent`
+   `{ type: 'rfm1-engine-ready', protocol: 1, minor: 1 }` from `iframe.contentWindow`. `minor: 1` (protocol v1.1)
+   means the engine honours `install`'s `expect` (below). A v1.0 engine sends no `minor` and ignores `expect`, so a
+   host that relies on the binding checks `minor >= 1` first. The engine posts it to `window.parent`
    on load, with its own origin as the target origin.
 2. The host sends `{ type: 'rfm1-engine-connect' }` with a transferred `MessagePort`:
    `iframe.contentWindow.postMessage({ type: 'rfm1-engine-connect' }, origin, [port2])`. The engine accepts it only
@@ -31,11 +33,13 @@ serve:
   inherited from `Object.prototype` (`toString`, `constructor`…), an `op` that isn't a string, and a missing `op`;
 - malformed arguments get `error.code = 'refused'` with `detail` starting `bad request`, and nothing is done. For
   example: `install` without a `target` object, a `target.kind` or `config` URL that isn't a string, a
-  non-boolean `resume`, or an empty or non-string `portHint`.
+  non-boolean `resume`, an empty or non-string `portHint`, or a malformed `expect` (not an object, a `port` without
+  `input` and `output` names, a `mode` other than `'normal'` or `'update'`, a non-string `identity`, or a `firmware`
+  without a string `kind`).
 
 A message that is neither (not an object, or with no `id` and no `op`) gets no reply.
 
-- `config({ v15Url, firmwareBase })` → `{ protocol: 1, v15Url, firmwareBase }`. The URLs the host provides, so the
+- `config({ v15Url, firmwareBase })` → `{ protocol: 1, minor: 1, v15Url, firmwareBase }`. The URLs the host provides, so the
   engine never hard-codes an API. Send it once after connect.
   - `v15Url`: the official V15 package (M-VAVE's `FM-1.fwsc`). The engine checks it against the official V15's
     SHA-256 (`fm1pkg.js` `STOCK_V15_SHA256`).
@@ -45,7 +49,9 @@ A message that is neither (not an object, or with no `id` and no `op`) gets no r
 - `look({ portHint? })` → `Fm1State`. Reads what is on the FM-1: the OTA identity (the update protocol's handshake),
   RemoteFM1's HELLO (only to a unit that answers as V15), the INFO backup protocol, and update mode.
   `portHint` (a MIDI port name) restricts the probe to that port. Without it, two answering FM-1s are refused.
-- `install({ target, resume? })` → `{ installed: Fm1State }`. `target` is one of:
+- `install({ target, resume?, expect? })` → `{ installed: Fm1State }`. `expect` (protocol v1.1) binds the install
+  to the unit the host verified: see [Protocol v1.1](#protocol-v11-install-binds-to-the-verified-unit). `target` is
+  one of:
   - `{ kind: 'remote' }`: the bundled newest RemoteFM1;
   - `{ kind: 'v15' }`: the official V15, fetched from `v15Url`;
   - `{ kind: 'package', url, sha256, label }`: a restore. `sha256` (64 hex digits) is required, and the download must
@@ -67,6 +73,59 @@ A message that is neither (not an object, or with no `id` and no `op`) gets no r
 
 Exactly one op (`config`, `look` or `install`) runs at a time. Any of them sent while another runs gets
 `error.code = 'busy'`. Only `cancel` is answered while an op runs.
+
+## Protocol v1.1: install binds to the verified unit
+
+Protocol v1.1 is additive. `expect` is optional, so v1 hosts still work: without it `install` behaves exactly as in
+v1. TuttiDAW always sends it. In v1, `install` probes the ports again after the download with nothing to tie the
+probe to the unit the host verified. A user who swaps unit A for unit B (one that holds user data) during the
+download gets B flashed without B's consent. With `expect`, the install writes only the unit the host verified.
+
+```ts
+interface InstallExpect {
+  port: { input: string; output: string };     // the ports `look` returned for this unit
+  mode: 'normal' | 'update';                   // the mode the host verified
+  identity?: string;                           // the OTA identity / INFO identity `look` reported
+  firmware?: { kind: string; name?: string; version?: string };  // the firmware `look` reported (normal mode)
+}
+```
+
+The host builds it from its own `look` of the unit: `port`, `mode`, `identity` (`Fm1State.identity`, the handshake
+identity, new in v1.1) and `firmware`'s `kind`, `name` and `version`. When `expect` is given, the engine applies
+these rules:
+
+- **Exactly one candidate unit.** There must be exactly one FM-1-family unit present at two moments: at the start of
+  the install (before the download), and again when the updater selects its device. That device is the normal port
+  for an install, or the update loader's port for a resume, whose name may differ (e.g. "Felucca Update"). The
+  updater also selects the loader it waits for after step 1, so the same count applies there. A unit counts when an
+  FM-1-family port answers the update protocol's handshake. If the updater sees a new port while it asks the others,
+  it asks that port too. Zero units is `disconnected`. More than one is `ambiguousUnit` ("unplug the other FM-1s"),
+  and nothing is sent to any of them. An FM-1 port that another app holds is `portBusy`, as in v1.
+- **Same unit.** Before the first write SysEx, the engine re-reads the unit it is about to write, with the same probes
+  as `look`. Then:
+  - Its mode must equal `expect.mode`.
+  - In normal mode its ports must equal `expect.port`.
+  - `expect.identity`, when given, must equal the handshake identity. In normal mode the INFO text also matches.
+  - `expect.firmware`, when given (normal mode), must match: the same `kind`, plus `name` and `version` when given.
+
+  A mismatch gives `unitChanged`, and nothing is written. The updater checks the port and the identity once more at its
+  own selection (the update's handshake, just before the update request). These checks come before the refusal
+  rules, so a unit swapped in is `unitChanged`, whatever the rules would say of it.
+  - A unit in update mode may re-enumerate as the update loader under another port name. Then the loader's identity
+    replaces the port-name check: it must be our own loader (`fm1ota.js` `OUR_LOADER`, `ota-FM-1_7NN..9NN`). Another
+    firmware's loader under another port name (the official `ota-FM-1_0NN` included) is `refused`, and nothing is
+    written. Under the port name `look` reported, the official loader still resumes the V15.
+- **Order.** The check runs after any download, immediately before the commit point. That is the same point where
+  the cancel check sits, and there is no await between the final check and setting `writing`. With `expect`, the
+  engine reads the release list before it re-reads the unit, so that re-read is the last await before the commit.
+- **Detour step 2.** The host sends a fresh `expect` from a fresh `look` after step 1. The unit then runs the V15,
+  so its firmware is not the one it ran before. The engine never chains steps on its own.
+- **Resume.** `install({ target, resume: true, expect })` takes `expect.mode = 'update'` (from `look` in update mode:
+  the loader's port and `identity`, no `firmware`). A unit found in normal mode is then `unitChanged`.
+
+`unitChanged` and `ambiguousUnit` both mean nothing was written. The one exception is `ambiguousUnit` at the loader
+after step 1 (a second FM-1 plugged in while the first restarts into update mode). There, too, the app area is not
+written, but the unit stays in update mode: `look` then reports `resumable`.
 
 ## Engine → host events (no `id`)
 
@@ -97,9 +156,12 @@ interface Fm1State {
   mode: 'normal' | 'update' | 'uboot';                     // update = 3 flashes, black screen; uboot = WL82 UBOOT1.00
   firmware: Fm1Firmware | null;                            // null when not in normal mode
   resumable: boolean;                                      // an install cut off that `install({ resume: true })` finishes
+  identity?: string;                                       // v1.1: the handshake identity ("FM-1_015", "ota-FM-1_900"), for expect.identity
   previous?: { name: string; version?: string; sha256?: string };   // what the unit ran (INFO), for the restore record
 }
-type EngineError = { code: 'firmwareUnavailable' | 'portBusy' | 'sysexDenied' | 'disconnected' | 'refused' | 'cancelled' | 'verifyFailed' | 'timeout' | 'busy' | 'internal'; detail: string; httpStatus?: number };
+type EngineError = { code: 'firmwareUnavailable' | 'portBusy' | 'sysexDenied' | 'disconnected' | 'refused' | 'cancelled' | 'verifyFailed' | 'timeout' | 'busy' | 'internal'
+                         | 'unitChanged' | 'ambiguousUnit';   // v1.1 (install with expect)
+                     detail: string; httpStatus?: number };
 ```
 
 Errors are machine-readable. `detail` is for logs and "Copy details" only, and the host writes all user-facing text.
@@ -152,6 +214,8 @@ Errors are machine-readable. `detail` is for logs and "Copy details" only, and t
 | `verifyFailed` | The SHA-256 or the package check failed, or after the install the FM-1 reports another firmware than the one written. |
 | `timeout` | The loader didn't appear, stalled (before its first read or mid-write), or the FM-1 didn't come back after the write. |
 | `busy` | Another op runs, or a `cancel` came after the install committed to the write (or during `config` / `look`). |
+| `unitChanged` | v1.1, `install` with `expect`: the unit about to be written is not the one the host verified. Its mode, ports, identity or firmware differ from `expect`, either at the engine's re-read after the download or at the updater's selection. Nothing was written. Run `look` again and ask the user to confirm the unit now connected. |
+| `ambiguousUnit` | v1.1, `install` with `expect`: more than one FM-1 answers, at the start of the install or at the updater's selection (the normal port, or the loader). Nothing was written. The host asks the user to unplug the other FM-1s. |
 | `internal` | No `config` yet (`v15Url` / `firmwareBase` missing), an unknown, inherited, non-string or missing op, or anything unexpected. |
 
 ## Vendoring
@@ -195,7 +259,19 @@ The published site also serves the engine: `engine.html` and `engine.js` at its 
   follow. After it, the cancel must be `busy` and the install must finish;
 - the stalls: step 1's (`portBusy`) and the loader's before its first read (`timeout`);
 - the dispatch: unknown, inherited, non-string and missing ops, malformed arguments, one reply per request, and no
-  unhandled rejection.
+  unhandled rejection;
+- protocol v1.1 (`expect`), on a bench of fake units that the paused-run harness swaps or adds while an install is
+  held:
+  - unit A swapped for unit B during the download is `unitChanged`, with no write SysEx to either unit. Without
+    `expect`, the same swap writes B (v1 is unchanged);
+  - a second FM-1 at the start, after the re-read, and during the updater's own scan is `ambiguousUnit`;
+  - our loader re-enumerated under another port name is accepted. Another loader under another port name is
+    `refused`;
+  - firmware, version, identity and mode mismatches are `unitChanged`;
+  - a resume with `expect.mode = 'update'` works;
+  - the final check sits right before `op.writing = true`, with no await from the re-read to the commit;
+  - a swap at every sync point before the update request writes nothing;
+  - the cancel tests above, run again with `expect`.
 
 `node web/installer/test_installer.mjs` still tests the page's decisions. CI runs both
 (`.github/workflows/installer-tests.yml` on pull requests, and the Pages build).

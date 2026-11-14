@@ -35,5 +35,5 @@ jobs:
           node-version: 22
       - name: The installer against a simulated FM-1
         run: node web/installer/test_installer.mjs
-      - name: The headless engine (protocol v1) through a MessagePort
+      - name: The headless engine (protocol v1.1) through a MessagePort
         run: node web/test_engine.mjs

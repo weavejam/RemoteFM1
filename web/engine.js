@@ -1,20 +1,22 @@
 // SPDX-License-Identifier: GPL-3.0-only
-// The headless RemoteFM1 installer engine, protocol v1 (docs/ENGINE.md). engine.html loads it in a hidden same-origin
+// The headless RemoteFM1 installer engine, protocol v1.1 (docs/ENGINE.md). engine.html loads it in a hidden same-origin
 // iframe (allow="midi") of a host page (TuttiDAW's FM-1 setup wizard); the host talks to it only through a MessagePort.
 // It owns the Web MIDI SysEx access during an install and decides nothing of its own: what the FM-1 runs, what may be
 // installed over it and how, is installer/installer.js (decide, stateOf, restorePathOf, resumableWith), the protocol
 // installer/fm1ota.js (Felucca's, as TransitFM1 carries it), the packages installer/fm1pkg.js, all GPL-3.0-only.
 //
-// Handshake: on load it posts { type: "rfm1-engine-ready", protocol: 1 } to window.parent; the parent (and only the
+// Handshake: on load it posts { type: "rfm1-engine-ready", protocol: 1, minor: 1 } to window.parent; the parent (and only the
 // parent, same origin) answers { type: "rfm1-engine-connect" } with a transferred MessagePort. Then, over the port:
 //   host -> engine  { id, op: "config" | "look" | "install" | "cancel", ...args }
 //   engine -> host  { id, ok: true, result } | { id, ok: false, error: { code, detail, httpStatus? } }   (one per op)
 //                   { event: "progress", stage, done, total } | { event: "port", state: "found" | "lost" }
 import { look as lookFm1, decide, stateOf, resumableWith, packageFrom } from "./installer/installer.js";
-import { Updater, PORT_RE } from "./installer/fm1ota.js";
+import { Updater, PORT_RE, boundMismatch } from "./installer/fm1ota.js";
 import { sha256hex, STOCK_V15_SHA256 } from "./installer/fm1pkg.js";
 
 export const PROTOCOL = 1;
+// v1.1 (additive): install's expect binds the install to the unit the host verified (unitChanged, ambiguousUnit)
+export const PROTOCOL_MINOR = 1;
 // the ports probed: the installer's, and firmwares' own port names it does not list (web/managers/managers.json)
 export const ENGINE_PORT_RE = new RegExp(`${PORT_RE.source}|jiant|loom|duell|pigeon|tonitor|coralflower|fimba|fomni|speak37|bubba`, "i");
 // names that are an FM-1 (not a generic "USB-MIDI" interface): a port of these names that is held or silent is busy
@@ -25,7 +27,8 @@ export class EngineError extends Error {
   constructor(code, detail, extra = {}) { super(`${code}: ${detail}`); this.code = code; this.detail = detail; Object.assign(this, extra); }
   toJSON() { return { code: this.code, detail: this.detail, ...(this.httpStatus !== undefined ? { httpStatus: this.httpStatus } : {}) }; }
 }
-const CODES = new Set(["firmwareUnavailable", "portBusy", "sysexDenied", "disconnected", "refused", "cancelled", "verifyFailed", "timeout", "busy", "internal"]);
+const CODES = new Set(["firmwareUnavailable", "portBusy", "sysexDenied", "disconnected", "refused", "cancelled", "verifyFailed", "timeout", "busy", "internal",
+                       "unitChanged", "ambiguousUnit"]);
 
 // an error of any origin -> EngineError. stage: where the install was ("prepare" | "enter-update" | "write" | "reboot")
 export function toEngineError(e, stage = "prepare") {
@@ -40,6 +43,9 @@ export function toEngineError(e, stage = "prepare") {
     case "stopped": return stage === "write" ? new EngineError("timeout", msg) : new EngineError("portBusy", msg);
     case "noloader": case "noreturn": return new EngineError("timeout", msg);
     case "mismatch": return new EngineError("verifyFailed", msg);
+    // the binding (v1.1 expect): another unit than the one verified, or more than one: nothing was written
+    case "changed": return new EngineError("unitChanged", msg);
+    case "ambiguous": return new EngineError("ambiguousUnit", msg);
     default: return new EngineError("internal", msg);
   }
 }
@@ -106,14 +112,54 @@ export function createEngine({ requestMIDIAccess, fetch: fetchFn, releases = nul
     return { get inputs() { return f(a.inputs); }, get outputs() { return f(a.outputs); } };
   };
 
-  // look() of installer.js, with the busy port told from no FM-1 -> its raw result
-  async function probe(a, hint) {
+  // look() of installer.js, with the busy port told from no FM-1 -> its raw result. bound (an install with expect):
+  // several FM-1s are ambiguousUnit, not refused
+  async function probe(a, hint, bound = false) {
     const h = await held(hint ? only(a, hint) : a);
     if (h) throw busyError(h, "is held by another app (it cannot be opened)");
     const st = await lookFm1(hint ? only(a, hint) : a, log, { portRe: ENGINE_PORT_RE });
     if (st.none) { const s = silent(hint ? only(a, hint) : a); if (s) throw busyError(s, "does not answer (another app floods or holds it)"); }
+    if (st.several && bound) throw new EngineError("ambiguousUnit", `several FM-1s answer (${st.list.join(", ")}): unplug the other FM-1s`);
     if (st.several) throw new EngineError("refused", `several FM-1s answer (${st.list.join(", ")}): connect one, or pass portHint`);
     return st;
+  }
+
+  // v1.1: the units an install with expect may write: exactly one answers (the FM-1-family ports that answer the
+  // update protocol's handshake), else disconnected (none) or ambiguousUnit (several). A held FM-1 port is portBusy,
+  // as in probe
+  async function oneUnit(a) {
+    const h = await held(a);
+    if (h) throw busyError(h, "is held by another app (it cannot be opened)");
+    const got = await new Updater(a, log, ENGINE_PORT_RE).answering();
+    got.forEach((d) => d.link.close());
+    if (got.length > 1) throw new EngineError("ambiguousUnit", `several FM-1s answer (${got.map((d) => `${d.id.text} (${d.name})`).join(", ")}): unplug the other FM-1s`);
+    if (!got.length) {
+      const s = silent(a);
+      if (s) throw busyError(s, "does not answer (another app floods or holds it)");
+      throw new EngineError("disconnected", "no FM-1 found");
+    }
+  }
+
+  // v1.1: is the unit probe() just read the one the host verified (expect)? Its mode, its port (normal mode; in update
+  // mode a loader under another port name must be our own: fm1ota.js boundMismatch), its identity (the handshake's, or
+  // the INFO text) and its firmware (kind, name, version) -> nothing, or throws unitChanged (refused for another
+  // firmware's loader under another port). Synchronous: install calls it with no await before its commit
+  function sameUnit(st, expect) {
+    const now = stateOf(st, {});
+    const changed = (what) => new EngineError("unitChanged", `the FM-1 is not the one verified (${what}): nothing was written`);
+    if (now.mode !== expect.mode) throw changed(`mode ${now.mode}, not ${expect.mode}`);
+    const why = boundMismatch({ mode: expect.mode, port: expect.port.input }, { id: { text: st.identity, model: st.identity.split("_")[0] }, name: st.ports.input });
+    if (why === "foreign") throw new EngineError("refused", `the FM-1 is in the update mode of another firmware under another port (${st.identity}, ${st.ports.input}): nothing was written`);
+    if (why) throw changed(`port ${st.ports.input}, not ${expect.port.input}`);
+    if (expect.mode === "normal" && now.port.output !== expect.port.output) throw changed(`port ${now.port.output}, not ${expect.port.output}`);
+    if (expect.identity !== undefined && expect.identity !== st.identity && !(expect.mode === "normal" && expect.identity === st.version))
+      throw changed(`identity ${st.identity}${st.version ? ` (${st.version})` : ""}, not ${expect.identity}`);
+    const want = expect.firmware;
+    if (want && expect.mode === "normal") {
+      const fw = now.firmware || {};
+      if (fw.kind !== want.kind || (want.name !== undefined && fw.name !== want.name) || (want.version !== undefined && fw.version !== want.version))
+        throw changed(`firmware ${JSON.stringify(fw)}, not ${JSON.stringify(want)}`);
+    }
   }
   async function context() {
     let list = [];
@@ -124,7 +170,7 @@ export function createEngine({ requestMIDIAccess, fetch: fetchFn, releases = nul
   async function opConfig(a) {
     if (typeof a.v15Url === "string") cfg.v15Url = a.v15Url;
     if (typeof a.firmwareBase === "string") cfg.firmwareBase = a.firmwareBase.endsWith("/") ? a.firmwareBase : a.firmwareBase + "/";
-    return { protocol: PROTOCOL, v15Url: cfg.v15Url, firmwareBase: cfg.firmwareBase };
+    return { protocol: PROTOCOL, minor: PROTOCOL_MINOR, v15Url: cfg.v15Url, firmwareBase: cfg.firmwareBase };
   }
 
   async function opLook(a) {
@@ -197,10 +243,13 @@ export function createEngine({ requestMIDIAccess, fetch: fetchFn, releases = nul
   async function opInstall(a, op) {
     const target = a.target;
     const check = () => { if (op.cancelled) throw cancelled(); };
+    const expect = a.expect || null;                   // v1.1 (absent: v1, unchanged)
     const src = await source(target);
     check();
     const acc = await midi();
     check();
+    // v1.1: with expect, exactly one unit from the start (a second FM-1 plugged in: ambiguousUnit before the download)
+    if (expect) { await oneUnit(acc); check(); }
     const ac = typeof AbortController === "function" ? new AbortController() : null;
     op.abort = () => { if (ac) ac.abort(); };
 
@@ -215,9 +264,17 @@ export function createEngine({ requestMIDIAccess, fetch: fetchFn, releases = nul
     progress("verify", 1, 1);
     check();
 
-    const st = await probe(acc, null);
+    // v1.1: with expect, the release list is read before the unit (cached: no await after the re-read below), so the
+    // re-read of the unit is the install's last await before its commit
+    const ctx = expect ? await context() : null;
+    check();
+    // the re-read of the unit to write (look's probes), after the download
+    const st = await probe(acc, null, !!expect);
     check();
     if (st.none) throw new EngineError("disconnected", "no FM-1 found");
+    // v1.1: the same unit as the host verified, before the refusal rules (a swapped-in unit is unitChanged, whatever
+    // the rules would say of it); checked again at the commit below
+    if (expect) sameUnit(st, expect);
     const d = decide(st, pkg, { midiClosed: true, detour: true });
     if (a.resume && d.action !== "resume") throw new EngineError("refused", "resume: the FM-1 is not in update mode");
     if (d.action === "refuse") throw new EngineError("refused", `${d.reason}: ${st.fw ? st.fw.name : st.identity || ""}`.trim());
@@ -227,11 +284,13 @@ export function createEngine({ requestMIDIAccess, fetch: fetchFn, releases = nul
       if (rw === "v15" && !pkg.official) throw new EngineError("refused", `the official update mode (${st.identity}) takes M-VAVE's V15 only`);
     }
     check();
-    const prev = d.action === "install" ? stateOf(st, await context()).previous : undefined;
+    const prev = d.action === "install" ? stateOf(st, ctx || await context()).previous : undefined;
 
     // the write: the last check and the commit, no await between them. From here no cancel (busy). (Each install of
     // the V15 detour, the V15 and then RemoteFM1, is an install op of its own, with its own checks and commit.)
+    // v1.1: the final same-unit check sits here too, synchronous, between the cancel check and the commit
     check();
+    if (expect) sameUnit(st, expect);
     op.writing = true;
     if (d.action === "install") previous = prev;
     const total = Math.ceil(pkg.image.length / BLOCK);
@@ -245,7 +304,10 @@ export function createEngine({ requestMIDIAccess, fetch: fetchFn, releases = nul
       else if (k === "reboot") { stage = "reboot"; progress("reboot", 0, 1); }
       else if (k === "done") progress("reboot", 1, 1);
     };
-    const up = new Updater(acc, log, ENGINE_PORT_RE, idleMs ? { idleMs } : {});
+    // v1.1: the updater bound to that unit: at its own selection (the update's handshake, just before the update
+    // request) it must still be the only unit, on its port with its identity (fm1ota.js Updater opts.bind)
+    const bind = expect ? { mode: expect.mode, port: st.ports.input, identity: st.identity } : null;
+    const up = new Updater(acc, log, ENGINE_PORT_RE, { ...(idleMs ? { idleMs } : {}), ...(bind ? { bind } : {}) });
     try {
       if (d.action === "resume") {
         const ok = await up.resume(pkg.image, step, pkg.official ? { product: pkg.product } : { package: pkg.product });
@@ -292,6 +354,15 @@ export function createEngine({ requestMIDIAccess, fetch: fetchFn, releases = nul
       if (!isObj(a.target)) throw bad("install: target must be an object");
       if (typeof a.target.kind !== "string") throw bad("install: target.kind must be a string");
       if (a.resume !== undefined && typeof a.resume !== "boolean") throw bad("install: resume must be a boolean");
+      if (a.expect === undefined || a.expect === null) return;                     // (v1: no binding)
+      const x = a.expect, str = (v) => typeof v === "string" && v.length > 0;
+      if (!isObj(x)) throw bad("install: expect must be an object");
+      if (!isObj(x.port) || !str(x.port.input) || !str(x.port.output)) throw bad("install: expect.port must be { input, output } port names");
+      if (x.mode !== "normal" && x.mode !== "update") throw bad("install: expect.mode must be 'normal' or 'update'");
+      if (x.identity !== undefined && !str(x.identity)) throw bad("install: expect.identity must be a string");
+      if (x.firmware !== undefined && (!isObj(x.firmware) || !str(x.firmware.kind) ||
+          (x.firmware.name !== undefined && typeof x.firmware.name !== "string") || (x.firmware.version !== undefined && typeof x.firmware.version !== "string")))
+        throw bad("install: expect.firmware must be { kind, name?, version? }");
     },
   };
 
@@ -363,7 +434,7 @@ export function boot(win, nav, opts = {}) {
     if (!ev.data || ev.data.type !== "rfm1-engine-connect" || !ev.ports || !ev.ports[0]) return;
     engine.attach(ev.ports[0]);
   });
-  win.parent.postMessage({ type: "rfm1-engine-ready", protocol: PROTOCOL }, origin === "null" ? "*" : origin);
+  win.parent.postMessage({ type: "rfm1-engine-ready", protocol: PROTOCOL, minor: PROTOCOL_MINOR }, origin === "null" ? "*" : origin);
   return engine;
 }
 
