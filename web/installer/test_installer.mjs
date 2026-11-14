@@ -54,7 +54,11 @@ if (!process.argv[2]) {
   const files = readdirSync(new URL("./firmware/", import.meta.url)).filter((f) => f.endsWith(".fwsc")).sort().join();
   const summed = sums.trim().split("\n").map((l) => l.split(/\s+/)[1]).sort().join();
   ok(files === listed && summed === listed, `firmware/ holds the listed packages only (${files})`);
-  ok(rels[0].version === "0.1.1" && !files.includes("remote-0.1.fwsc"), "RemoteFM1 0.1.1 is offered, 0.1 is not published");
+  ok(rels[0].version === "0.2.1" && rels[0].latest === true && rels.slice(1).every((r) => !r.latest) && rels[0].sha256 === "62a6b619c73b88248591067bd414124b288fa7628b26cc2b3895a2957f52f362",
+     "RemoteFM1 0.2.1 is the latest (first, marked latest), TuttiDAW's package by its SHA-256");
+  ok(rels.map((r) => r.version).join() === "0.2.1,0.1.1" && !files.includes("remote-0.1.fwsc"), "0.1.1 stays listed as history, 0.1 is not published");
+  ok(/^velocity, poly aftertouch$/.test(rels[0].notes[0]) && /weavejam\/RemoteFM1\/tree\/08bae22/.test(rels[0].source) && !rels[0].tag,
+     "0.2.1: notes 'velocity, poly aftertouch', its source the fork's commit (no upstream tag: Quixotic7's v0.2.1 is another build)");
 }
 const rel = { version: "9.9", sha256: sha };
 const fakeFetch = (bytes) => async (url) => ({ ok: url === "firmware/remote-9.9.fwsc", status: 404, arrayBuffer: async () => bytes.buffer });

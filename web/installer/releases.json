@@ -1,7 +1,21 @@
 {
-  "about": "The RemoteFM1 releases the web installer offers, newest first (index.html installs the first). sha256 is the package's (firmware/remote-X.Y.fwsc), as firmware/SHA256SUMS lists it: test_installer.mjs checks the two agree, and the page checks it again in the browser before any write.",
+  "about": "The RemoteFM1 releases the web installer offers, newest first: the first is the latest (\"latest\": true), the one index.html and the engine install; the others are history (a unit running one is offered the latest). sha256 is the package's (firmware/remote-X.Y.fwsc), as firmware/SHA256SUMS lists it: test_installer.mjs checks the two agree, and the page checks it again in the browser before any write. A release built from another tree than repo's names it in source.",
   "repo": "https://github.com/Quixotic7/RemoteFM1",
   "releases": [
+    {
+      "version": "0.2.1",
+      "date": "2026-10-25",
+      "latest": true,
+      "source": "https://github.com/weavejam/RemoteFM1/tree/08bae220674f38e57df195a12a5b95b38d7efd4b",
+      "sha256": "62a6b619c73b88248591067bd414124b288fa7628b26cc2b3895a2957f52f362",
+      "notes": [
+        "velocity, poly aftertouch",
+        "weavejam's build of RemoteFM1 (branch velocity, commit 08bae22, built by its fwsc CI): Note On velocity 1..127 from the keys' carbon pills (CTL-1's sensing, fm1-base / felucca-bsp, MPL-2.0); the top row too.",
+        "Poly aftertouch for held keys F3..C5: lean into a key after it has settled (not in its first 250 ms, when the pill is still compressing).",
+        "A note-on waits up to ~15 ms for its velocity; a key with no reading plays at 100 as before. Hosts that don't know the new capability bits work as with 0.1.",
+        "Tested on an FM-1 on 2026-10-25: velocities 1..127 with no fallbacks, chords and releases clean, MASTER, LEDs, buttons and encoders as 0.1.1. The update loader and safeguards are 0.1.1's."
+      ]
+    },
     {
       "version": "0.1.1",
       "date": "2026-10-18",

@@ -220,7 +220,7 @@ function remoteEntry() {
     tag: "Waits for a host",
     what: "The firmware this site installs, running as itself. It turns an FM-1 into a USB panel for a computer, so it makes no sound of its own: it shows a screen and waits for a host. In a browser tab, no host is coming.",
     license: "GPL-3.0-only",
-    source: rel.repo,
+    source: r.source || rel.repo,
     repo: "Quixotic7/RemoteFM1",
     release: r.tag ? `${rel.repo}/releases/tag/${r.tag}` : null,
     site: null,
