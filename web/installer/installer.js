@@ -67,18 +67,19 @@ export function remoteHello(input, output, ms = 800) {
 
 // what the connected FM-1 runs -> { none } | { several, list } | { loader, identity } |
 // { identity, port, version, fw, remote: { name, proto, version } | null }; each found one also has ports: { input,
-// output } (the MIDI port names). opts.portRe: the port names probed (default fm1ota.js PORT_RE)
+// output } (the MIDI port names) and endpoints: { input, output } (the MIDIInput / MIDIOutput objects themselves: the
+// engine's endpoint session, protocol v1.1). opts.portRe: the port names probed (default fm1ota.js PORT_RE)
 export async function look(access, log = () => {}, opts = {}) {
   const up = new Updater(access, log, opts.portRe);
   const all = await up.all();
   if (!all.length) return { none: true };
   if (all.length > 1) return { several: true, list: all.map((d) => `${d.id.text} (${d.name})`) };
   const d = all[0];
-  const ports = { input: d.input.name, output: d.output.name };
-  if (/^ota-/i.test(d.id.model)) return { loader: true, identity: d.id.text, port: d.name, ports };
+  const ports = { input: d.input.name, output: d.output.name }, endpoints = { input: d.input, output: d.output };
+  if (/^ota-/i.test(d.id.model)) return { loader: true, identity: d.id.text, port: d.name, ports, endpoints };
   const remote = d.id.text === IDENTITY ? await remoteHello(d.input, d.output) : null;
   const version = remote ? null : await deviceInfo(d.input, d.output);
-  return { identity: d.id.text, port: d.name, ports, version, fw: classifyFirmware(d.id.text, version, d.name), remote };
+  return { identity: d.id.text, port: d.name, ports, endpoints, version, fw: classifyFirmware(d.id.text, version, d.name), remote };
 }
 
 // ---- the decisions, pure (no MIDI, no page): install() below, page.js and the headless engine (../engine.js) ----
@@ -166,12 +167,14 @@ const versionIn = (info) => ((/(\d+(?:\.\d+)+\S*)/.exec(info || "") || [])[1]) |
 
 // look()'s result as the engine protocol's Fm1State (docs/ENGINE.md). ctx: { newest: the newest bundled RemoteFM1
 // version, previous: what the unit ran before an install this session cut off (for update mode), releases: [{ version,
-// sha256 }] (a RemoteFM1 previous gets its package's SHA-256) }
+// sha256 }] (a RemoteFM1 previous gets its package's SHA-256) }. identity (protocol v1.1, additive): the update
+// protocol's handshake identity ("FM-1_015", "ota-FM-1_900"), what a host passes back as install's expect.identity
 export function stateOf(st, ctx = {}) {
   if (st.none || st.several) return { port: null, mode: "normal", firmware: null, resumable: false };
   const port = st.ports ? { input: st.ports.input, output: st.ports.output } : { input: st.port, output: st.port };
+  const identity = st.identity ? { identity: st.identity } : {};
   if (st.loader) {
-    const out = { port, mode: "update", firmware: null, resumable: !!resumableWith(st) };
+    const out = { port, mode: "update", firmware: null, resumable: !!resumableWith(st), ...identity };
     if (ctx.previous) out.previous = ctx.previous;
     return out;
   }
@@ -197,7 +200,7 @@ export function stateOf(st, ctx = {}) {
     firmware = { kind: "unknown", ...(st.identity ? { identity: st.identity } : {}) };
     previous = { name: st.identity || "unknown" };
   }
-  return { port, mode: "normal", firmware, resumable: false, previous };
+  return { port, mode: "normal", firmware, resumable: false, ...identity, previous };
 }
 
 // a sentence for "What is on my FM-1?"

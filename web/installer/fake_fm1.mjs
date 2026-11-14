@@ -9,7 +9,9 @@
 // The failures the engine maps: held (open() rejects, as when another app holds the port on Windows), mute (the port
 // answers nothing: another app floods it), stall (UPGRADE taken but no request follows: step 1 stalled, TransitFM1
 // 0.1.1), loaderStall (the loader takes its UPGRADE but asks for nothing), unplugAt (unplugged after that many loader
-// reads, mid-write), noReturn (the written firmware never appears).
+// reads, mid-write), noReturn (the written firmware never appears). portId: its ports' ids ("i" / "o" + portId; default
+// random): two identical units given one portId get the same ids, as a browser may give a unit plugged into the same
+// socket.
 // The tests' sync points: gate(kind, detail) -> a promise the fake waits on before it takes a message (kind "hs",
 // "hello", "info", "upgrade" or "data"; in order, one at a time) or opens a port (kind "open"). sent: every message
 // sent to it, by kind, logged the moment it is sent (before a gate holds it).
@@ -33,11 +35,12 @@ export function kindOf(d) {
 export class FakeFM1 {
   constructor(image, { identity = "FM-1_015", name = "FM-1", version = null, loader = "ota-FM-1_900", final = IDENTITY, remote = null,
                        finalRemote, finalVersion = null, held = false, mute = false, stall = false, loaderStall = false, unplugAt = -1,
-                       noReturn = false, gate = null } = {}) {
+                       noReturn = false, gate = null, portId = null } = {}) {
     this.image = image; this.served = 0; this.bad = 0; this.upgrades = 0; this.version = version; this.remote = remote; this.hellos = 0;
     this.loader = loader; this.final = final; this.finalRemote = finalRemote === undefined ? remote : finalRemote;
     this.finalVersion = finalVersion;
     this.held = held; this.mute = mute; this.stall = stall; this.loaderStall = loaderStall; this.unplugAt = unplugAt; this.noReturn = noReturn;
+    this.portId = portId;
     this.loaderReads = 0; this.writes = []; this.sent = []; this.gate = gate; this.chain = Promise.resolve();
     this.access = { inputs: new Map(), outputs: new Map(), onstatechange: null };
     this.boot(identity, name);
@@ -57,7 +60,7 @@ export class FakeFM1 {
   boot(identity, name) {
     this.unplug();
     this.identity = identity; this.waiting = null; this.queue = [];
-    const id = Math.random().toString(36).slice(2), held = this.held;
+    const id = this.portId || Math.random().toString(36).slice(2), held = this.held;
     const open = (what) => async () => {
       if (this.gate) await this.gate("open", `${what} ${name}`);
       if (held) throw Object.assign(new Error("port in use"), { name: "InvalidAccessError" });

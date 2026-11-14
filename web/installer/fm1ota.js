@@ -29,7 +29,10 @@ export const PORT_RE = /fm-1|smk|elite|mke-p37|starry|felucca|sloop|clipper|melo
 
 // errors carry a code the pages translate: notfound, model, stopped, noloader, lost, noreturn,
 // mismatch (detail: the identity the device reports), badreq, other (an SMK firmware with its own updater),
-// foreign (detail: the loader's identity)
+// foreign (detail: the loader's identity); under a binding (Updater opts.bind, engine protocol v1.1): changed (the unit
+// is not the one bound to), continuity (step 1 done: the unit re-enumerated into its loader, step 2 is a resume),
+// interrupted (the bound link was lost after an update request: a transfer was in progress, the unit may be partly
+// programmed; nothing was sent after the loss)
 function fail(code, msg, detail = "") { const e = new Error(msg); e.code = code; e.detail = detail; return e; }
 
 export function pack7(data) {
@@ -131,6 +134,22 @@ export function refusalText(name) {
 }
 export const REFUSE_REASON = "An install over it has left an FM-1 that no longer starts, and the data it leaves in the flash is not known to be safe for ChoralRoot.";
 
+// The binding of engine protocol v1.1 (docs/ENGINE.md): is the unit found the one the host verified? bind: { mode:
+// "normal" | "update", port: the input port's name, identity?: the handshake identity }; dev: { id, name } (find()'s)
+// -> null (the same unit) | "changed" | "foreign". A unit in update mode may re-enumerate under another port name (the
+// loader's own, "Felucca Update"): then our own loader (OUR_LOADER) takes the place of the port name's check, and any
+// other loader under another name is foreign. The identity, when bound, must still be the same
+export function boundMismatch(bind, dev) {
+  const update = IS_OTA(dev.id);
+  if (update !== (bind.mode === "update")) return "changed";
+  if (dev.name !== bind.port) {
+    if (!update) return "changed";
+    if (!OUR_LOADER(dev.id)) return "foreign";
+  }
+  if (bind.identity && dev.id.text !== bind.identity) return "changed";
+  return null;
+}
+
 // one MIDI in/out pair with a SysEx queue
 class Link {
   constructor(input, output) {
@@ -186,13 +205,21 @@ const FM1_PORT = PORT_RE;                                       // never probe o
 export class Updater {
   // portRe: the port names probed (default PORT_RE; the engine adds firmwares' own port names, e.g. "JIANT FM").
   // opts.idleMs: { step1, write }, how long step 1 and the loader may stay silent (default 8 s and 180 s; the tests
-  // shorten them)
+  // shorten them). opts.bind (engine protocol v1.1): { mode, port, identity?, input, output, verify?, alive? }: the
+  // device install() and resume() write is the endpoint pair input/output (no scan), whose handshake must match
+  // (boundMismatch: changed / foreign otherwise); verify(input, output) (async, throws) re-validates the whole
+  // expectation on that pair; alive() (synchronous, throws) checks the pair's continuity just before each update
+  // request and right before each transfer response (serve: every data block and completion acknowledgement). install()
+  // then stops after step 1 (code "continuity"): step 2 is a resume of its own. Under the binding a link lost after an
+  // update request is "interrupted", never "nothing was written"
   constructor(access, log, portRe = FM1_PORT, opts = {}) {
     this.access = access;
     this.log = log || (() => {});
     this.portRe = portRe || FM1_PORT;
     const idle = opts.idleMs || {};
     this.idle = { step1: idle.step1 || 8000, write: idle.write || 180000 };
+    this.bind = opts.bind || null;
+    this.requested = 0;                        // update requests sent (from the first one, a transfer may be under way)
   }
 
   // the input ports that may be an FM-1 (connected, a name that matches)
@@ -224,6 +251,49 @@ export class Updater {
     return got;
   }
 
+  // every unit that answers, its link left open -> [{ link, id, name }]. The candidates are listed again after each
+  // pass: a port that appeared while the others were asked is asked too (a second FM-1 plugged in during the scan)
+  async answering() {
+    const got = [], asked = new Set();
+    for (let fresh; (fresh = this.candidates().filter((p) => !asked.has(p))).length;) {
+      for (const input of fresh) {
+        asked.add(input);
+        const output = pairOutput(this.access, input);
+        if (!output) continue;
+        try { await input.open(); await output.open(); } catch (_) { continue; }
+        const link = new Link(input, output);
+        const id = await handshake(link, 2);
+        if (id) got.push({ link, id, name: input.name }); else link.close();
+      }
+    }
+    return got;
+  }
+
+  // the device install() / resume() writes: find(filter). Under the binding (engine protocol v1.1) there is no scan:
+  // the device is the endpoint pair the engine validated (bind.input, bind.output), asked on those very objects. Its
+  // handshake must be the bound unit's (boundMismatch), then bind.verify(input, output) re-reads it in full (mode,
+  // identity, firmware, the loader's fit) on the same pair, and the link written through is a link on that pair
+  async select(filter) {
+    if (!this.bind) return this.find(filter);
+    const { input, output } = this.bind, alive = () => { if (this.bind.alive) this.bind.alive(); };
+    alive();
+    if (input.state === "disconnected" || output.state === "disconnected") return null;
+    try { await input.open(); await output.open(); } catch (_) { alive(); return null; }
+    let link = new Link(input, output);
+    const id = await handshake(link, 2);
+    if (!id) { link.close(); alive(); return null; }
+    const why = boundMismatch(this.bind, { id, name: input.name });
+    if (why) {
+      link.close();
+      throw fail(why, why === "foreign"
+        ? `the device is in the update mode of another firmware under another port (${id.text}, ${input.name}): nothing was written`
+        : `the device is not the one verified (${id.text} on ${input.name}, not ${this.bind.identity || this.bind.mode} on ${this.bind.port}): nothing was written`, id.text);
+    }
+    if (this.bind.verify) { link.close(); await this.bind.verify(input, output); link = new Link(input, output); }
+    if (filter && !filter(id)) { link.close(); return null; }
+    return { link, id, name: input.name };
+  }
+
   async waitFor(filter, ms) {
     const end = Date.now() + ms;
     while (Date.now() < end) {
@@ -234,10 +304,25 @@ export class Updater {
     return null;
   }
 
+  // the update request: the device's commit. Under the binding, bind.alive() (synchronous: the endpoints' continuity)
+  // is the last thing before it, with no await between them
+  request(link) {
+    if (this.bind && this.bind.alive) this.bind.alive();
+    this.requested++;
+    return link.send(UPGRADE);
+  }
+
   // serve read requests until the device asks for one of the finish addresses; stops early
-  // when the port disappears (lost: true) instead of waiting out idleMs
+  // when the port disappears (lost: true) instead of waiting out idleMs. Under the binding every response is guarded:
+  // bind.alive() (synchronous) right before its send, with no await between them. On a loss the link is closed at once
+  // and the transfer ends with "interrupted": not one byte more to whatever is on those endpoints now
   async serve(link, image, finishAddr, idleMs, onProgress) {
     let served = 0, last = Date.now();
+    const guard = () => {
+      if (!this.bind || !this.bind.alive) return;
+      try { this.bind.alive(); } catch (e) { link.close(); throw this.interrupted(finishAddr, served, (e && (e.why || e.message)) || String(e)); }
+    };
+    const respond = (bytes) => { guard(); return link.send(bytes); };
     for (;;) {
       const pkt = await link.read(1000);
       if (!pkt) {
@@ -248,14 +333,15 @@ export class Updater {
       const r = parseRequest(pkt);
       if (!r) continue;
       last = Date.now();
+      guard();                                  // (a request from what is no longer the bound unit: not even badreq)
       if (r.addr === 0xE0000000 || r.addr === 0xF0000000) {
-        link.send(response(r.addr, [...new TextEncoder().encode("success"), 0]));
+        respond(response(r.addr, [...new TextEncoder().encode("success"), 0]));
         if (r.addr === finishAddr) return { served, finished: true };
         continue;
       }
       if (r.len > MAXDATA || r.addr + r.len > image.length) throw fail("badreq", `bad request ${r.addr.toString(16)}+${r.len}`);
       await sleep(10);
-      if (!link.send(response(r.addr, Array.from(image.subarray(r.addr, r.addr + r.len)), r.fl))) {
+      if (!respond(response(r.addr, Array.from(image.subarray(r.addr, r.addr + r.len)), r.fl))) {
         return { served, finished: false, lost: true };
       }
       served++;
@@ -263,25 +349,46 @@ export class Updater {
     }
   }
 
+  // the bound transfer cut off after an update request -> the "interrupted" error. finishAddr: step 1's (the running
+  // firmware staging its loader) or the loader's (the app area being programmed)
+  interrupted(finishAddr, served, why) {
+    const what = finishAddr === 0xE0000000
+      ? "step 1 (the running firmware staging its update loader) was in progress: the unit may be left in update mode"
+      : "the write was in progress: the app area may be partially programmed, and the unit stays in update mode (resumable)";
+    return fail("interrupted", `the link to the unit being updated was lost after ${served} requests (${why}); ${what}. ` +
+      "Nothing more was sent. Look again, ask the user whether it is the same FM-1, and resume");
+  }
+
   // full install: running firmware -> loader -> new firmware. anyModel: the package may be for another model of the
   // same keyboard (an SMK-37 Elite package on a unit that reports SMK-37 Pro); never an FM-1 one on an SMK, nor back
   async install(image, product, onStep, anyModel = false) {
     const step = onStep || (() => {});
-    const dev = await this.find((id) => !IS_OTA(id));
+    const dev = await this.select((id) => !IS_OTA(id));
     if (!dev) throw fail("notfound", "FM-1 not found (USB cable, and no other app using it?)");
     if (OTHER_SMK(dev.id)) { dev.link.close(); throw fail("other", `the keyboard runs a firmware with its own updater (${dev.id.text}): nothing was sent`, dev.id.text); }
     const [model] = product.split("_");
     if (dev.id.model !== model && !(anyModel && sameKeyboard(dev.id.model, model))) { dev.link.close(); throw fail("model", `the device is ${dev.id.text}, the package is for ${product}`); }
     step("start", dev.id.text);
-    dev.link.send(UPGRADE);
+    this.request(dev.link);
     await sleep(2000);
     const s1 = await this.serve(dev.link, image, 0xE0000000, this.idle.step1, (n) => step("verify", n));
     dev.link.close();
     // some firmwares restart into their loader at once, without step 1: such a loader (ours, of this keyboard) goes on
     const jumped = !s1.finished && s1.lost && s1.served === 0;
+    // under the binding a link lost in the middle of step 1 is an interrupted update, never "nothing was written"
+    if (this.bind && !s1.finished && !jumped && s1.lost) throw this.interrupted(0xE0000000, s1.served, "the port was disconnected");
     if (!s1.finished && !jumped) throw fail(s1.lost ? "lost" : "stopped", `the device ${s1.lost ? "was disconnected" : "stopped"} after ${s1.served} requests: nothing was written`);
     step("loader");
     await sleep(3000);
+    // under the binding the restart into the loader ends the endpoints' continuity: no unit can be told from another
+    // across it, so step 2 is never chained here. Once a loader answers, the install stops ("continuity"): the host
+    // looks again (a fresh session on the loader), asks the user whether it is the same FM-1, and resumes
+    if (this.bind) {
+      const any = await this.waitFor(IS_OTA, jumped ? 15000 : 30000);
+      if (!any) throw fail("noloader", "the update loader did not appear. Replug the USB cable and look again: the device stays in update mode until it is finished.");
+      any.link.close();
+      throw fail("continuity", `the FM-1 restarted into update mode (${any.id.text} on ${any.name}): the link to the unit verified ended there. Look again, confirm it is the same FM-1, and resume`, any.id.text);
+    }
     const ota = await this.waitFor(jumped ? IS_OTA : (id) => id.model === "ota-" + model, jumped ? 15000 : 30000);
     if (jumped && !(ota && OUR_LOADER(ota.id) && sameKeyboard(ota.id.model.replace(/^ota-/i, ""), dev.id.model) &&
                     (ota.id.model === "ota-" + model || (anyModel && sameKeyboard(ota.id.model.replace(/^ota-/i, ""), model))))) {
@@ -306,10 +413,15 @@ export class Updater {
   // a stall is the loader's (it may hold a part of the new image), not step 1's
   async write(ota, image, step) {
     step("writing");
-    ota.link.send(UPGRADE);
+    this.request(ota.link);
     await sleep(2000);
     const s2 = await this.serve(ota.link, image, 0xF0000000, this.idle.write, (n) => step("write", n));
     ota.link.close();
+    // under the binding an unfinished write is never "nothing was written": lost, interrupted; stalled, stopped
+    if (this.bind && !s2.finished) {
+      if (s2.lost) throw this.interrupted(0xF0000000, s2.served, "the port was disconnected");
+      throw fail("stopped", `the loader stopped after ${s2.served} requests: the app area may be partially programmed, and the unit stays in update mode (resumable)`);
+    }
     return s2;
   }
 
@@ -321,7 +433,7 @@ export class Updater {
   async resume(image, onStep, opts = {}) {
     const want = opts.product || opts.package || "";
     const model = want.split("_")[0];
-    const ota = await this.find(IS_OTA);
+    const ota = await this.select(IS_OTA);
     if (!ota) return false;
     if (!OUR_LOADER(ota.id) && !opts.product) {   // (the return to stock: the official loader's own image)
       ota.link.close();
